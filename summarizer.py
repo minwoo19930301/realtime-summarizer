@@ -46,9 +46,11 @@ APPLE_STT_SRC = HERE / "stt" / "apple_stt.swift"
 APPLE_LOCALES = {"ko": "ko-KR", "en": "en-US", "zh": "zh-CN", "ja": "ja-JP"}
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 SENT_END = re.compile(r"(?<=[.?!。？！])\s+")
+STT_BACKOFF = [1, 2, 4, 8, 15]  # 실시간 도우미가 죽었을 때 다시 띄우기까지 기다리는 초
 
 SAMPLE_RATE = 16000
 FRAME_MS = 30
+STT_BACKLOG_FRAMES = 30_000 // FRAME_MS  # 실시간 도우미가 다시 뜨는 동안 모아 둘 소리: 최대 30초
 # 고정 길이로 자르면 경계에 걸친 문장이 통째로 사라져서, 말이 멈춘 지점(무음)에서 자른다.
 MIN_SPEECH_RMS = 300        # 16-bit PCM 기준 최소 발화 에너지
 NOISE_MULTIPLIER = 1.8      # 배경 소음 대비 이만큼 커야 말소리로 본다 (맥북 마이크 실측: 조용 150~250, 말 450~840)
@@ -460,6 +462,7 @@ class Summarizer:
         self.saved_files: dict[str, str] = {}
         self.ffmpeg: subprocess.Popen | None = None
         self.stt: subprocess.Popen | None = None  # Apple 실시간 받아쓰기 도우미
+        self._stt_eof = False  # 캡처가 끝나 도우미 입력을 닫았는지 (그 뒤로는 다시 띄우지 않는다)
         self._stop = threading.Event()
         self._summarizing = threading.Lock()
         self.digests: list[dict] = []   # 구간 요약: {id, start, end, from, to, bullets | failed, tr?}
@@ -543,11 +546,8 @@ class Summarizer:
                  "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
-            self.stt = None
-            if apple:
-                locale = APPLE_LOCALES.get(self.config["language"], "ko-KR")
-                self.stt = subprocess.Popen([str(APPLE_STT), "--locale", locale], stdin=subprocess.PIPE,
-                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            self.stt = self._spawn_stt() if apple else None
+            self._stt_eof = False
             self.recording = True
         self._write_draft()
         threading.Thread(target=self._capture_loop, daemon=True).start()
@@ -555,6 +555,11 @@ class Summarizer:
         threading.Thread(target=self._summary_loop, daemon=True).start()
         threading.Thread(target=self._translate_loop, daemon=True).start()
         self.status_ch.publish({"type": "recording", "recording": True})
+
+    def _spawn_stt(self) -> subprocess.Popen:
+        locale = APPLE_LOCALES.get(self.config["language"], "ko-KR")
+        return subprocess.Popen([str(APPLE_STT), "--locale", locale], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     def stop(self) -> None:
         with self.lock:
@@ -583,6 +588,7 @@ class Summarizer:
         seg: list[bytes] = []
         speech_ms = silence_ms = 0
         idx = 0
+        dead, backlog = None, []  # 실시간 도우미가 죽어 다시 뜨는 동안의 소리 (새 도우미에 이어서 넣는다)
 
         def flush() -> None:
             nonlocal seg, speech_ms, silence_ms, idx
@@ -615,12 +621,19 @@ class Summarizer:
             if n % 10 == 0:  # 약 0.3초마다 화면에 입력 크기를 알려 "듣고 있는지"를 보이게 한다
                 self.status_ch.publish({"type": "level", "level": round(level), "threshold": round(threshold),
                                         "speaking": speaking})
-            if self.stt:  # 실시간 엔진: 무음 분할 없이 소리를 그대로 흘려 넣는다
+            stt = self.stt
+            if stt:  # 실시간 엔진: 무음 분할 없이 소리를 그대로 흘려 넣는다
+                if stt is dead:
+                    backlog = (backlog + [frame])[-STT_BACKLOG_FRAMES:]
+                    continue
                 try:
-                    self.stt.stdin.write(frame)
-                    self.stt.stdin.flush()
+                    if backlog:
+                        stt.stdin.write(b"".join(backlog))
+                        backlog = []
+                    stt.stdin.write(frame)
+                    stt.stdin.flush()
                 except (BrokenPipeError, ValueError, OSError):
-                    pass
+                    dead, backlog = stt, (backlog + [frame])[-STT_BACKLOG_FRAMES:]
                 continue
             if seg:
                 seg.append(frame)
@@ -636,10 +649,12 @@ class Summarizer:
                 speech_ms, silence_ms = FRAME_MS, 0
             preroll = (preroll + [frame])[-(PREROLL_MS // FRAME_MS):]
         if self.stt:
-            try:
-                self.stt.stdin.close()  # 입력 끝 → 도우미가 남은 소리를 확정하고 끝낸다
-            except OSError:
-                pass
+            with self.lock:  # 도우미를 다시 띄우는 중이면 새 도우미에도 입력 끝을 알리도록 잠금 안에서
+                self._stt_eof = True
+                try:
+                    self.stt.stdin.close()  # 입력 끝 → 도우미가 남은 소리를 확정하고 끝낸다
+                except OSError:
+                    pass
         else:
             flush()
             self.segments.put(None)
@@ -699,35 +714,66 @@ class Summarizer:
 
         애플 엔진은 말을 멈춰야 final을 준다. 쉬지 않고 이어 말하면 한 줄이 끝없이 길어지므로,
         partial 안에서 이미 끝난 문장(뒤에 다음 문장이 시작됐고 직전 partial과 글자가 같은 것)은
-        바로 줄로 올린다. final이 오면 아직 안 올린 나머지 문장을 올린다."""
-        proc = self.stt
-        committed, prev = 0, []  # 이번 발화에서 줄로 올린 문장 수, 직전 partial의 문장들
-        for raw in proc.stdout:
-            try:
-                ev = json.loads(raw)
-            except ValueError:
-                continue
-            kind = ev.get("type")
-            if kind == "partial":
-                sents = split_sentences(ev.get("text", ""))
-                while (committed < len(sents) - 1 and committed < len(prev)
-                       and sents[committed] == prev[committed]):
-                    self._add_line(sents[committed])
-                    committed += 1
-                prev = sents
-                self.transcript_ch.publish({"type": "partial", "text": " ".join(sents[committed:])})
-            elif kind == "final":
-                sents = split_sentences(ev.get("text", ""))
-                self.transcript_ch.publish({"type": "partial", "text": ""})
-                log(f"stt final: {' '.join(sents)[:80]!r} (앞 {committed}문장은 이미 올림)")
-                for sent in sents[committed:]:
-                    self._add_line(sent)
-                committed, prev = 0, []
-            elif kind == "status":
-                self.status_ch.publish({"type": "notice", "message": ev.get("message", "")})
-            elif kind == "error":
-                self.status_ch.publish({"type": "error", "message": f"받아쓰기 오류: {ev.get('message', '')}"})
-        proc.wait()
+        바로 줄로 올린다. final이 오면 아직 안 올린 나머지 문장을 올린다.
+
+        녹음 도중 도우미가 죽으면 다시 띄운다 (minute-summary의 규칙: 종료 코드 2는 되풀이해도 소용없는
+        문제라 그만두고, 그 밖은 1·2·4·8·15초 뒤 다시 시작. 1분 넘게 잘 돌았으면 횟수를 다시 센다)."""
+        restarts = 0
+        while True:
+            proc, began = self.stt, time.time()
+            committed, prev = 0, []  # 이번 발화에서 줄로 올린 문장 수, 직전 partial의 문장들
+            for raw in proc.stdout:
+                try:
+                    ev = json.loads(raw)
+                except ValueError:
+                    continue
+                kind = ev.get("type")
+                if kind == "partial":
+                    sents = split_sentences(ev.get("text", ""))
+                    while (committed < len(sents) - 1 and committed < len(prev)
+                           and sents[committed] == prev[committed]):
+                        self._add_line(sents[committed])
+                        committed += 1
+                    prev = sents
+                    self.transcript_ch.publish({"type": "partial", "text": " ".join(sents[committed:])})
+                elif kind == "final":
+                    sents = split_sentences(ev.get("text", ""))
+                    self.transcript_ch.publish({"type": "partial", "text": ""})
+                    log(f"stt final: {' '.join(sents)[:80]!r} (앞 {committed}문장은 이미 올림)")
+                    for sent in sents[committed:]:
+                        self._add_line(sent)
+                    committed, prev = 0, []
+                elif kind == "status":
+                    self.status_ch.publish({"type": "notice", "message": ev.get("message", "")})
+                elif kind == "error":
+                    self.status_ch.publish({"type": "error", "message": f"받아쓰기 오류: {ev.get('message', '')}"})
+            code = proc.wait()
+            with self.lock:
+                ended = self._stt_eof or not self.recording
+            if ended:
+                break
+            # 녹음 도중에 멈춤: 아직 줄로 안 올린 말부터 살린다
+            for sent in prev[committed:]:
+                self._add_line(sent)
+            self.transcript_ch.publish({"type": "partial", "text": ""})
+            if time.time() - began >= 60:
+                restarts = 0
+            if code == 2 or restarts >= len(STT_BACKOFF):
+                why = "시작할 수 없습니다" if code == 2 else "계속 멈춥니다"
+                log(f"apple-stt 종료 코드 {code}, 포기")
+                self.status_ch.publish({"type": "error", "message": f"받아쓰기 도우미가 {why} (종료 코드 {code}). 녹음을 멈춥니다"})
+                threading.Thread(target=self.stop, daemon=True).start()
+                break
+            delay = STT_BACKOFF[restarts]
+            restarts += 1
+            log(f"apple-stt 종료 코드 {code}, {delay}초 뒤 다시 시작 ({restarts}/{len(STT_BACKOFF)})")
+            self.status_ch.publish({"type": "notice", "message": f"받아쓰기 도우미가 멈춰 다시 시작합니다 ({restarts}/{len(STT_BACKOFF)})"})
+            if self._stop.wait(delay):
+                break
+            with self.lock:
+                if self._stt_eof or not self.recording:
+                    break
+                self.stt = self._spawn_stt()
         self._summarize_now(final=True)
         shutil.rmtree(self.session_dir, ignore_errors=True)
 
