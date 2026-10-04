@@ -403,6 +403,7 @@ class Scribe:
         self.stt: subprocess.Popen | None = None  # Apple 실시간 받아쓰기 도우미
         self._stop = threading.Event()
         self._summarizing = threading.Lock()
+        self._load_draft()
 
     # --- 상태 ---
 
@@ -671,12 +672,33 @@ class Scribe:
             APP_DIR.mkdir(parents=True, exist_ok=True)
             with self.lock:
                 data = {"started_at": self.started_at, "lines": self.lines, "summary": self.summary,
-                        "summary_tr": self.summary_tr, "translate": self.config["translate"]}
+                        "summary_tr": self.summary_tr, "translate": self.config["translate"],
+                        "saved": self.saved, "saved_files": self.saved_files}
             tmp = DRAFT_PATH.with_suffix(".tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             tmp.replace(DRAFT_PATH)
         except OSError as e:
             log(f"draft 저장 실패: {e}")
+
+    def _load_draft(self) -> None:
+        """서버를 다시 켜도 직전 회의가 화면에 남도록 임시 초안을 불러온다 (저장 여부까지)."""
+        try:
+            data = json.loads(DRAFT_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        self.lines = data.get("lines") or []
+        self.summary = data.get("summary") or ""
+        self.summary_tr = data.get("summary_tr") or ""
+        self.started_at = data.get("started_at") or 0.0
+        self.saved = data.get("saved", not self.lines and not self.summary)
+        self.saved_files = data.get("saved_files") or {}
+        self.summarized_upto = len(self.lines) if self.summary else 0
+        if self.summary:
+            self.summary_at = DRAFT_PATH.stat().st_mtime
+        if data.get("translate") == "off" or data.get("translate") in LANGUAGES:
+            self.config["translate"] = data["translate"]
+        if self.lines:
+            log(f"임시 초안 불러옴: {len(self.lines)}줄, 저장 {'됨' if self.saved else '안 됨'}")
 
     def save(self) -> dict:
         with self.lock:
@@ -697,6 +719,7 @@ class Scribe:
             files["summary"].write_text(summary + (f"\n\n---\n\n{summary_tr}" if summary_tr else "") + "\n", encoding="utf-8")
         with self.lock:
             self.saved, self.saved_files = True, {k: str(v) for k, v in files.items()}
+        self._write_draft()
         self.status_ch.publish({"type": "saved"})
         return self.saved_files
 
