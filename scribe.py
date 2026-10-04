@@ -27,6 +27,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PORT = int(os.environ.get("SCRIBE_PORT", "8792"))
+# 테스트용: 마이크 대신 이 오디오 파일을 실시간 속도로 흘려 넣는다 (스피커로 소리를 내지 않고 전체 경로를 확인)
+TEST_INPUT = os.environ.get("SCRIBE_INPUT", "")
 HERE = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("SCRIBE_DATA_DIR", Path.home() / "Documents" / "meetings"))
 WHISPER_MODEL_DIRS = [Path.home() / ".cache" / "whisper", Path("/opt/homebrew/share/whisper-cpp")]
@@ -413,7 +415,7 @@ class Scribe:
         with self.lock:
             if self.recording:
                 return
-            if not self.config["device"] or not self.config["model"]:
+            if not (self.config["device"] or TEST_INPUT) or not self.config["model"]:
                 raise RuntimeError("마이크 또는 음성인식 모델이 없습니다")
             stamp = time.strftime("%Y%m%d-%H%M")
             DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -425,8 +427,10 @@ class Scribe:
             self._stop.clear()
             self.segments: queue.Queue = queue.Queue()
             ffmpeg = _bin("ffmpeg")
+            source = (["-re", "-i", TEST_INPUT] if TEST_INPUT
+                      else ["-f", "avfoundation", "-i", f":{self.config['device']}"])
             self.ffmpeg = subprocess.Popen(
-                [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "avfoundation", "-i", f":{self.config['device']}",
+                [ffmpeg, "-hide_banner", "-loglevel", "error", *source,
                  "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
@@ -503,7 +507,12 @@ class Scribe:
             preroll = (preroll + [frame])[-(PREROLL_MS // FRAME_MS):]
         flush()
         self.segments.put(None)
-        if self.recording:
+        if self.recording and TEST_INPUT:
+            log("test input finished")
+            self.recording = False
+            self._stop.set()
+            self.status_ch.publish({"type": "recording", "recording": False})
+        elif self.recording:
             err = (self.ffmpeg.stderr.read() or b"").decode(errors="ignore").strip()
             self.recording = False
             self._stop.set()
