@@ -49,6 +49,13 @@
   #summaryTr ul { margin: 0; padding-left: 18px; }
   #summaryTr p { margin: 6px 0; }
   .empty { color: var(--muted); }
+  .mic { display: none; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; margin-left: auto; }
+  .mic.on { display: inline-flex; }
+  .mic .bar { width: 70px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; position: relative; }
+  .mic .bar i { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--muted); transition: width .15s; }
+  .mic.speaking .bar i { background: var(--ok); }
+  #conn { display: none; background: var(--rec); color: #fff; font-size: 13px; padding: 7px 14px; }
+  #conn.show { display: block; }
   #summary h2 { font-size: 14px; margin: 14px 0 6px; }
   #summary h2:first-child { margin-top: 0; }
   #summary ul { margin: 0; padding-left: 18px; }
@@ -60,6 +67,7 @@
 </style>
 </head>
 <body>
+<div id="conn">서버와 연결이 끊겼습니다. 다시 연결하는 중… (서버가 꺼졌다면 다시 실행하세요)</div>
 <header>
   <h1><span class="dot" id="dot"></span> Meeting Scribe</h1>
   <label>마이크 <select id="device"></select></label>
@@ -78,7 +86,8 @@
 
 <main>
   <section>
-    <div class="head"><h2>받아적기</h2><span class="meta" id="tmeta"></span></div>
+    <div class="head"><h2>받아적기</h2><span class="meta" id="tmeta"></span>
+      <span class="mic" id="mic"><span class="bar"><i id="micbar"></i></span><span id="micstate">듣는 중</span></span></div>
     <div class="body" id="transcript"><div class="empty">녹음을 시작하면 여기에 실시간으로 받아적습니다.</div></div>
   </section>
   <section>
@@ -123,6 +132,8 @@ function renderControls() {
   $("toggle").textContent = rec ? "녹음 중지" : "녹음 시작";
   $("toggle").classList.toggle("stop", rec);
   $("dot").classList.toggle("on", rec);
+  $("mic").classList.toggle("on", rec);
+  if (!rec) { $("micbar").style.width = "0"; $("mic").classList.remove("speaking"); }
   for (const id of ["device", "model"]) $(id).disabled = rec;
   const f = state.files || {};
   $("files").textContent = f.transcript ? `저장: ${f.transcript}  ·  ${f.summary}` : "";
@@ -173,7 +184,9 @@ function providerName(id) {
 async function load() {
   state = await (await fetch("/api/state")).json();
   renderControls();
-  $("transcript").innerHTML = state.lines.length ? "" : $("transcript").innerHTML;
+  $("transcript").innerHTML = state.lines.length ? ""
+    : state.recording ? '<div class="empty">듣는 중… 말을 잠깐 멈추면 그 구간을 받아적습니다.</div>'
+    : '<div class="empty">녹음을 시작하면 여기에 실시간으로 받아적습니다.</div>';
   state.lines.forEach(addLine);
   setSummary(state.summary, state.summary_at, state.config.provider);
   $("summaryTr").innerHTML = state.summary_tr ? md(state.summary_tr) : "";
@@ -181,10 +194,18 @@ async function load() {
 }
 
 async function post(path, body) {
-  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
-  const j = await r.json();
-  if (j.error) { alert(j.error); return; }
+  let j;
+  try {
+    const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+    j = await r.json();
+  } catch (e) {
+    $("conn").classList.add("show");
+    alert("서버에 연결할 수 없습니다. 서버가 켜져 있는지 확인하세요.");
+    return null;
+  }
+  if (j.error) { alert(j.error); return null; }
   state = j; renderControls();
+  return j;
 }
 
 for (const id of ["device", "model", "provider", "interval", "translate"]) {
@@ -195,13 +216,26 @@ $("refresh").addEventListener("click", () => post("/api/refresh"));
 $("now").addEventListener("click", () => post("/api/summarize"));
 $("toggle").addEventListener("click", async () => {
   if (state.recording) return post("/api/stop");
-  $("transcript").innerHTML = '<div class="empty">듣는 중… (10초 단위로 받아적습니다)</div>';
+  const j = await post("/api/start");
+  if (!j || !j.recording) return;  // 시작 실패면 '듣는 중'을 띄우지 않는다
+  $("transcript").innerHTML = '<div class="empty">듣는 중… 말을 잠깐 멈추면 그 구간을 받아적습니다.</div>';
   setSummary("", 0); $("summaryTr").innerHTML = ""; $("smeta").textContent = ""; $("tmeta").textContent = ""; $("serr").textContent = "";
-  await post("/api/start");
 });
 
-new EventSource("/events/transcript").onmessage = (e) => {
-  const ev = JSON.parse(e.data);
+// 서버 이벤트 구독: 끊기면 배너, 다시 붙으면 전체 상태를 새로 불러온다 (재시작한 서버와 화면이 어긋나지 않게)
+function subscribe(path, onEvent) {
+  const es = new EventSource(path);
+  let opened = false;
+  es.onopen = () => {
+    $("conn").classList.remove("show");
+    if (opened) load();
+    opened = true;
+  };
+  es.onerror = () => { if (es.readyState !== EventSource.OPEN) $("conn").classList.add("show"); };
+  es.onmessage = (e) => onEvent(JSON.parse(e.data));
+}
+
+subscribe("/events/transcript", (ev) => {
   if (ev.type === "line") addLine(ev);
   if (ev.type === "translation") {
     const el = document.querySelector(`.line[data-id="${ev.id}"] .tr`);
@@ -209,20 +243,26 @@ new EventSource("/events/transcript").onmessage = (e) => {
   }
   if (ev.type === "reset_translations") document.querySelectorAll(".line .tr").forEach((el) => (el.textContent = ""));
   if (ev.type === "error") $("serr").textContent = ev.message;
-};
-new EventSource("/events/summary").onmessage = (e) => {
-  const ev = JSON.parse(e.data);
+});
+subscribe("/events/summary", (ev) => {
   if (ev.type === "working") $("smeta").textContent = `요약 중… (${providerName(ev.provider)})`;
   if (ev.type === "summary") { setSummary(ev.text, ev.at, ev.provider); $("serr").textContent = ""; }
   if (ev.type === "summary_tr") $("summaryTr").innerHTML = md(ev.text);
   if (ev.type === "error") { $("serr").textContent = ev.message; $("smeta").textContent = ""; }
-};
-new EventSource("/events/status").onmessage = async (e) => {
-  const ev = JSON.parse(e.data);
+});
+let sttBusy = false;
+subscribe("/events/status", async (ev) => {
+  if (ev.type === "level") {
+    $("micbar").style.width = Math.min(100, Math.round((ev.level / Math.max(1, ev.threshold * 2)) * 100)) + "%";
+    $("mic").classList.toggle("speaking", ev.speaking);
+    $("micstate").textContent = sttBusy ? "받아쓰는 중…" : ev.speaking ? "말소리 감지" : "듣는 중";
+    return;
+  }
+  if (ev.type === "stt") { sttBusy = ev.busy; if (sttBusy) $("micstate").textContent = "받아쓰는 중…"; return; }
   if (ev.type === "error") alert(ev.message);
   state = await (await fetch("/api/state")).json();
   renderControls();
-};
+});
 
 load();
 </script>
