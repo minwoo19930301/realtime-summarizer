@@ -285,12 +285,6 @@ def translate_summary(provider: str, lang: str, text: str) -> str:
     return complete(provider, TRANSLATE_SUMMARY_PROMPT.format(lang=LANGUAGES[lang], text=text))
 
 
-def post_webhook(url: str, title: str, markdown: str) -> None:
-    body = json.dumps({"msgtype": "markdown", "markdown": {"title": title, "text": markdown}}).encode()
-    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    urllib.request.urlopen(req, timeout=10).read()
-
-
 # ---------- 이벤트 브로드캐스트 (SSE) ----------
 
 class Channel:
@@ -347,7 +341,6 @@ class Scribe:
             "provider": default_provider(self.providers),
             "interval": 60,
             "language": "ko",
-            "webhook": "",
             "translate": "off",
             "glossary": "",
         }
@@ -395,7 +388,7 @@ class Scribe:
 
     def set_config(self, patch: dict) -> None:
         with self.lock:
-            for k in ("device", "model", "provider", "language", "webhook", "glossary"):
+            for k in ("device", "model", "provider", "language", "glossary"):
                 if k in patch:
                     self.config[k] = patch[k]
             if "translate" in patch and patch["translate"] != self.config["translate"]:
@@ -653,12 +646,6 @@ class Scribe:
                     self.summary_ch.publish({"type": "summary_tr", "text": self.summary_tr, "lang": lang})
                 except Exception as e:
                     self.summary_ch.publish({"type": "error", "message": f"요약 번역 실패: {str(e)[:200]}"})
-            if self.config["webhook"]:
-                try:
-                    body = text + (f"\n\n---\n\n{self.summary_tr}" if lang != "off" and self.summary_tr else "")
-                    post_webhook(self.config["webhook"], "회의 요약" + (" (최종)" if final else ""), body)
-                except Exception as e:
-                    self.summary_ch.publish({"type": "error", "message": f"웹훅 전송 실패: {e}"})
         finally:
             self._summarizing.release()
 

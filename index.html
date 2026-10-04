@@ -94,10 +94,6 @@
   <label style="margin:6px 0">자주 나오는 이름·용어
     <input type="text" id="glossary" style="width:420px;max-width:100%" placeholder="예: 사람 이름, 제품명, 약어">
   </label>
-  <details><summary>딩톡으로도 올리기 (선택)</summary>
-    단톡방 커스텀 봇 웹훅 주소를 넣으면 요약이 바뀔 때마다 올립니다.
-    <input type="text" id="webhook" placeholder="https://oapi.dingtalk.com/robot/send?access_token=...">
-  </details>
 </div>
 
 <script>
@@ -122,7 +118,6 @@ function renderControls() {
   fill($("provider"), state.providers, c.provider, state.auto_provider);
   fill($("translate"), state.languages, c.translate);
   $("interval").value = String(c.interval);
-  if (document.activeElement !== $("webhook")) $("webhook").value = c.webhook || "";
   if (document.activeElement !== $("glossary")) $("glossary").value = c.glossary || "";
   const rec = state.recording;
   $("toggle").textContent = rec ? "녹음 중지" : "녹음 시작";
@@ -195,7 +190,6 @@ async function post(path, body) {
 for (const id of ["device", "model", "provider", "interval", "translate"]) {
   $(id).addEventListener("change", () => post("/api/config", { [id]: id === "interval" ? Number($(id).value) : $(id).value }));
 }
-$("webhook").addEventListener("change", () => post("/api/config", { webhook: $("webhook").value.trim() }));
 $("glossary").addEventListener("change", () => post("/api/config", { glossary: $("glossary").value.trim() }));
 $("refresh").addEventListener("click", () => post("/api/refresh"));
 $("now").addEventListener("click", () => post("/api/summarize"));
