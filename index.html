@@ -35,8 +35,8 @@
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
             display: flex; flex-direction: column; min-height: 0; }
   section > .head { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--line); }
-  section > .head h2 { font-size: 13px; margin: 0; font-weight: 650; }
-  section > .head .meta { color: var(--muted); font-size: 12px; }
+  section > .head h2 { font-size: 13px; margin: 0; font-weight: 650; white-space: nowrap; }
+  section > .head .meta { color: var(--muted); font-size: 12px; min-width: 0; }
   .body { flex: 1; overflow: auto; padding: 12px 14px; }
   .line { display: grid; grid-template-columns: 64px 1fr; gap: 8px; padding: 3px 0; }
   .line .t { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; padding-top: 1px; }
@@ -52,9 +52,9 @@
   .settings { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 10px 18px;
               border-bottom: 1px solid var(--line); background: var(--panel); }
   .settings[hidden] { display: none; }
-  #settingsSummary { color: var(--muted); font-size: 12px; }
   .live { color: var(--muted); font-style: italic; padding: 2px 0 2px 64px; min-height: 1.4em; }
   .line .tr.pending { font-style: italic; opacity: .7; }
+  button { white-space: nowrap; flex-shrink: 0; }
   button:disabled { opacity: .45; cursor: default; }
   #savedNote { color: var(--muted); font-size: 12px; }
   .mic { display: none; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; margin-left: auto; }
@@ -78,7 +78,6 @@
 <div id="conn">서버와 연결이 끊겼습니다. 다시 연결하는 중… (서버가 꺼졌다면 다시 실행하세요)</div>
 <header>
   <h1><span class="dot" id="dot"></span> Realtime Summarizer</h1>
-  <span id="settingsSummary"></span>
   <div class="spacer"></div>
   <button id="settingsBtn" aria-expanded="false" title="설정 펼치기/접기">설정 ▾</button>
   <button id="save" disabled title="받아적기·번역·요약을 파일로 저장">저장</button>
@@ -134,11 +133,6 @@ function renderControls() {
   fill($("provider"), state.providers, c.provider, state.auto_provider);
   fill($("translate"), state.languages, c.translate);
   $("interval").value = String(c.interval);
-  const pick = (list, id) => (list.find((x) => x.id === id) || {}).name || "";
-  const short = (s) => s.split(" (")[0].split(" · ")[0];
-  $("settingsSummary").textContent = [short(pick(state.models, c.model)), short(pick(state.providers, c.provider)),
-    c.translate !== "off" ? "번역 " + short(pick(state.languages, c.translate)) : "", `요약 ${c.interval >= 60 ? c.interval / 60 + "분" : c.interval + "초"}마다`]
-    .filter(Boolean).join(" · ");
   const rec = state.recording;
   $("toggle").textContent = rec ? "녹음 중지" : "녹음 시작";
   $("toggle").classList.toggle("stop", rec);
@@ -202,14 +196,9 @@ function md(text) {
   return html.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
 }
 
-function setSummary(text, at, provider) {
+function setSummary(text, at) {
   $("summary").innerHTML = text ? md(text) : '<div class="empty">받아적은 내용이 쌓이면 주기마다 요약을 갱신합니다.</div>';
-  if (at) $("smeta").textContent = `${new Date(at * 1000).toLocaleTimeString("ko-KR")} 갱신` + (provider ? ` · ${providerName(provider)}` : "");
-}
-
-function providerName(id) {
-  const p = (state?.providers || []).find((x) => x.id === id);
-  return p ? p.name.split(" (")[0] : id;
+  if (at) $("smeta").textContent = `${new Date(at * 1000).toLocaleTimeString("ko-KR")} 갱신`;
 }
 
 async function load() {
@@ -220,7 +209,7 @@ async function load() {
     : '<div class="empty">녹음을 시작하면 여기에 실시간으로 받아적습니다.</div>';
   if (!$("transcript").querySelector(".live")) $("transcript").insertAdjacentHTML("beforeend", '<div class="live"></div>');
   state.lines.forEach(addLine);
-  setSummary(state.summary, state.summary_at, state.config.provider);
+  setSummary(state.summary, state.summary_at);
   $("summaryTr").innerHTML = state.summary_tr ? md(state.summary_tr) : "";
   $("serr").textContent = state.summary_error || "";
 }
@@ -305,9 +294,9 @@ subscribe("/events/transcript", (ev) => {
   }
 });
 subscribe("/events/summary", (ev) => {
-  if (ev.type === "working") $("smeta").textContent = `요약 중… (${providerName(ev.provider)})`;
+  if (ev.type === "working") $("smeta").textContent = "요약 중…";
   if (ev.type === "summary") {
-    setSummary(ev.text, ev.at, ev.provider); $("serr").textContent = "";
+    setSummary(ev.text, ev.at); $("serr").textContent = "";
     if (state) state.summary = ev.text;
     markDirty();
   }
