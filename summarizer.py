@@ -1,10 +1,10 @@
-"""Meeting Scribe — 회의를 실시간으로 받아적고, 주기적으로 요약을 갱신하는 로컬 서버.
+"""Realtime Summarizer — 회의를 실시간으로 받아적고, 주기적으로 요약을 갱신하는 로컬 서버.
 
-    python3 scribe.py          # http://localhost:8792
+    python3 summarizer.py          # http://localhost:8792
 
 받아적기: ffmpeg(avfoundation)로 녹음 → 기본은 macOS 온디바이스 실시간 받아쓰기(bin/apple-stt, 말하는 도중 중간 결과),
           또는 무음 지점에서 잘라 whisper-cli(whisper.cpp)로 텍스트화.
-저장: 녹음 중에는 임시 초안(~/Library/Application Support/Meeting Scribe/draft.json)에만 두고, 화면의 "저장"을 누르면
+저장: 녹음 중에는 임시 초안(~/Library/Application Support/Realtime Summarizer/draft.json)에만 두고, 화면의 "저장"을 누르면
       ~/Documents/meetings 에 받아적기·번역·요약 파일로 남긴다.
 요약: 지금까지의 요약 + 새로 받아적은 부분을 프로바이더에 넘겨 전체 요약을 다시 씀.
 프로바이더는 이 맥에서 쓸 수 있는 것을 자동으로 찾아 기본값으로 두고, 화면에서 바꿀 수 있다.
@@ -29,15 +29,15 @@ import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-PORT = int(os.environ.get("SCRIBE_PORT", "8792"))
+PORT = int(os.environ.get("SUMMARIZER_PORT", "8792"))
 # 테스트용: 마이크 대신 이 오디오 파일을 실시간 속도로 흘려 넣는다 (스피커로 소리를 내지 않고 전체 경로를 확인)
-TEST_INPUT = os.environ.get("SCRIBE_INPUT", "")
+TEST_INPUT = os.environ.get("SUMMARIZER_INPUT", "")
 HERE = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("SCRIBE_DATA_DIR", Path.home() / "Documents" / "meetings"))
+DATA_DIR = Path(os.environ.get("SUMMARIZER_DATA_DIR", Path.home() / "Documents" / "meetings"))
 WHISPER_MODEL_DIRS = [Path.home() / ".cache" / "whisper", Path("/opt/homebrew/share/whisper-cpp")]
 OLLAMA_URL = "http://localhost:11434"
 # 에이전트 CLI들은 실행 폴더를 "신뢰"할지 묻거나 그 폴더를 읽으려 해서, 비어 있는 전용 폴더에서 돌린다.
-APP_DIR = Path(os.environ.get("SCRIBE_APP_DIR", Path.home() / "Library" / "Application Support" / "Meeting Scribe"))
+APP_DIR = Path(os.environ.get("SUMMARIZER_APP_DIR", Path.home() / "Library" / "Application Support" / "Realtime Summarizer"))
 WORK_DIR = APP_DIR / "workdir"
 DRAFT_PATH = APP_DIR / "draft.json"
 APPLE_STT = HERE / "bin" / "apple-stt"
@@ -78,7 +78,7 @@ def _bin(name: str) -> str | None:
 
 
 def log(msg: str) -> None:
-    if os.environ.get("SCRIBE_DEBUG", "1") != "0":
+    if os.environ.get("SUMMARIZER_DEBUG", "1") != "0":
         print(time.strftime("%H:%M:%S"), msg, flush=True)
 
 
@@ -126,7 +126,7 @@ def ensure_apple_stt() -> bool:
     if r.returncode != 0:
         log(f"apple-stt 빌드 실패: {r.stderr.strip()[-300:]}")
         return False
-    subprocess.run(["codesign", "--force", "--sign", "-", str(APPLE_STT)], capture_output=True, stdin=subprocess.DEVNULL)
+    subprocess.run(["codesign", "--force", "--sign", "-", "--identifier", "com.minwokim.realtime-summarizer.apple-stt", str(APPLE_STT)], capture_output=True, stdin=subprocess.DEVNULL)
     return True
 
 
@@ -368,7 +368,7 @@ def _write_wav(path: Path, pcm: bytes) -> None:
         w.writeframes(pcm)
 
 
-class Scribe:
+class Summarizer:
     def __init__(self) -> None:
         self.transcript_ch = Channel()
         self.summary_ch = Channel()
@@ -463,7 +463,7 @@ class Scribe:
                 raise RuntimeError("실시간 받아쓰기 도우미(bin/apple-stt)를 만들 수 없습니다. 받아적기 모델을 whisper로 바꾸세요")
             self.started_at = time.time()
             self.saved, self.saved_files = True, {}
-            self.session_dir = Path(tempfile.mkdtemp(prefix="scribe-"))
+            self.session_dir = Path(tempfile.mkdtemp(prefix="summarizer-"))
             self.lines, self.summary, self.summary_at, self.summarized_upto, self.summary_error = [], "", 0.0, 0, ""
             self.summary_tr = ""
             self._stop.clear()
@@ -818,7 +818,7 @@ class Scribe:
             self._summarizing.release()
 
 
-SCRIBE: Scribe | None = None
+SUMMARIZER: Summarizer | None = None
 
 
 # ---------- HTTP ----------
@@ -869,50 +869,50 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif self.path == "/api/state":
-            self._json(SCRIBE.state())
+            self._json(SUMMARIZER.state())
         elif self.path == "/events/transcript":
-            self._sse(SCRIBE.transcript_ch)
+            self._sse(SUMMARIZER.transcript_ch)
         elif self.path == "/events/summary":
-            self._sse(SCRIBE.summary_ch)
+            self._sse(SUMMARIZER.summary_ch)
         elif self.path == "/events/status":
-            self._sse(SCRIBE.status_ch)
+            self._sse(SUMMARIZER.status_ch)
         else:
             self._json({"error": "not found"}, 404)
 
     def do_POST(self) -> None:
         try:
             if self.path == "/api/start":
-                SCRIBE.start()
+                SUMMARIZER.start()
             elif self.path == "/api/stop":
-                SCRIBE.stop()
+                SUMMARIZER.stop()
             elif self.path == "/api/config":
-                SCRIBE.set_config(self._body())
+                SUMMARIZER.set_config(self._body())
             elif self.path == "/api/refresh":
-                SCRIBE.refresh_sources()
+                SUMMARIZER.refresh_sources()
             elif self.path == "/api/summarize":
-                threading.Thread(target=SCRIBE._summarize_now, daemon=True).start()
+                threading.Thread(target=SUMMARIZER._summarize_now, daemon=True).start()
             elif self.path == "/api/save":
-                SCRIBE.save()
+                SUMMARIZER.save()
             else:
                 return self._json({"error": "not found"}, 404)
-            self._json(SCRIBE.state())
+            self._json(SUMMARIZER.state())
         except Exception as e:
             self._json({"error": str(e)}, 400)
 
 
 def main() -> None:
-    global SCRIBE
+    global SUMMARIZER
     if not _bin("ffmpeg"):
         raise SystemExit("ffmpeg 가 필요합니다: brew install ffmpeg")
     # whisper-cli 는 선택 (실시간 Apple 엔진만으로도 동작). 둘 다 없으면 화면에서 시작할 때 알려 준다.
-    SCRIBE = Scribe()
+    SUMMARIZER = Summarizer()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Meeting Scribe: http://localhost:{PORT}  (저장 버튼을 누르면 {DATA_DIR} 에 남깁니다)")
-    print(f"요약 프로바이더 자동 선택: {SCRIBE.auto_provider}")
+    print(f"Realtime Summarizer: http://localhost:{PORT}  (저장 버튼을 누르면 {DATA_DIR} 에 남깁니다)")
+    print(f"요약 프로바이더 자동 선택: {SUMMARIZER.auto_provider}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        SCRIBE.stop()
+        SUMMARIZER.stop()
 
 
 if __name__ == "__main__":

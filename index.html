@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Meeting Scribe</title>
+<title>Realtime Summarizer</title>
 <style>
   :root {
     --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #6e6e73; --line: #e4e2dd;
@@ -77,7 +77,7 @@
 <body>
 <div id="conn">서버와 연결이 끊겼습니다. 다시 연결하는 중… (서버가 꺼졌다면 다시 실행하세요)</div>
 <header>
-  <h1><span class="dot" id="dot"></span> Meeting Scribe</h1>
+  <h1><span class="dot" id="dot"></span> Realtime Summarizer</h1>
   <span id="settingsSummary"></span>
   <div class="spacer"></div>
   <button id="settingsBtn" aria-expanded="false" title="설정 펼치기/접기">설정 ▾</button>
@@ -247,11 +247,11 @@ function setSettingsOpen(open, refresh) {
   $("settings").hidden = !open;
   $("settingsBtn").textContent = open ? "설정 ▴" : "설정 ▾";
   $("settingsBtn").setAttribute("aria-expanded", String(open));
-  try { localStorage.setItem("scribe-settings-open", open ? "1" : "0"); } catch (e) {}
+  try { localStorage.setItem("summarizer-settings-open", open ? "1" : "0"); } catch (e) {}
   if (open && refresh && state && !state.recording) post("/api/refresh");  // 새로 꽂은 마이크·새로 깐 CLI도 보이게
 }
 $("settingsBtn").addEventListener("click", () => setSettingsOpen($("settings").hidden, true));
-try { setSettingsOpen(localStorage.getItem("scribe-settings-open") === "1", false); } catch (e) { setSettingsOpen(false, false); }
+try { setSettingsOpen(localStorage.getItem("summarizer-settings-open") === "1", false); } catch (e) { setSettingsOpen(false, false); }
 $("save").addEventListener("click", async () => { await post("/api/save"); });
 $("now").addEventListener("click", () => post("/api/summarize"));
 $("toggle").addEventListener("click", async () => {

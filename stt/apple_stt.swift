@@ -1,5 +1,5 @@
 // apple-stt — 표준입력으로 들어오는 16kHz 모노 s16le PCM을 macOS 온디바이스 받아쓰기(SpeechAnalyzer)로 바꿔
-// JSON 줄로 내보낸다. 마이크는 부모(scribe.py의 ffmpeg)가 잡으므로 이 도우미는 마이크 권한이 필요 없다.
+// JSON 줄로 내보낸다. 마이크는 부모(summarizer.py의 ffmpeg)가 잡으므로 이 도우미는 마이크 권한이 필요 없다.
 //
 // 출력(stdout, 한 줄에 JSON 하나):
 //   {"type":"ready","locale":"ko_KR"}
