@@ -1,0 +1,752 @@
+"""Meeting Scribe — 회의를 실시간으로 받아적고, 주기적으로 요약을 갱신하는 로컬 서버.
+
+    python3 scribe.py          # http://localhost:8792
+
+받아적기: ffmpeg(avfoundation)로 10초 단위 녹음 → whisper-cli(whisper.cpp)로 텍스트화.
+요약: 지금까지의 요약 + 새로 받아적은 부분을 프로바이더에 넘겨 전체 요약을 다시 씀.
+프로바이더는 이 맥에서 쓸 수 있는 것을 자동으로 찾아 기본값으로 두고, 화면에서 바꿀 수 있다.
+외부 의존성 없음(표준 라이브러리만).
+"""
+from __future__ import annotations
+
+import array
+import glob
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.request
+import wave
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+PORT = int(os.environ.get("SCRIBE_PORT", "8792"))
+HERE = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("SCRIBE_DATA_DIR", Path.home() / "Documents" / "meetings"))
+WHISPER_MODEL_DIRS = [Path.home() / ".cache" / "whisper", Path("/opt/homebrew/share/whisper-cpp")]
+OLLAMA_URL = "http://localhost:11434"
+# 에이전트 CLI들은 실행 폴더를 "신뢰"할지 묻거나 그 폴더를 읽으려 해서, 비어 있는 전용 폴더에서 돌린다.
+WORK_DIR = Path.home() / "Library" / "Application Support" / "Meeting Scribe" / "workdir"
+SAMPLE_RATE = 16000
+FRAME_MS = 30
+# 고정 길이로 자르면 경계에 걸친 문장이 통째로 사라져서, 말이 멈춘 지점(무음)에서 자른다.
+MIN_SPEECH_RMS = 300        # 16-bit PCM 기준 최소 발화 에너지
+NOISE_MULTIPLIER = 1.8      # 배경 소음 대비 이만큼 커야 말소리로 본다 (맥북 마이크 실측: 조용 150~250, 말 450~840)
+SMOOTH_FRAMES = 10          # 순간값 대신 0.3초 평균으로 판단해야 음절 사이 틈에서 끊기지 않음
+NOISE_WINDOW_FRAMES = 333   # 배경 소음 = 최근 10초 프레임 에너지의 하위 10%
+# (말하는 동안 소음 추정치가 따라 올라가면 기준이 말소리보다 높아져 받아적기가 끊기는 걸 실측으로 확인)
+END_SILENCE_MS = 700        # 이만큼 조용하면 한 덩어리 끝
+MAX_SEGMENT_MS = 25000      # 말이 안 끊겨도 이 길이에서 강제로 자름
+MIN_SPEECH_MS = 1000        # 말소리가 이보다 짧은 덩어리는 버림 (짧은 잡음에서 whisper가 문장을 지어내는 걸 실측으로 확인)
+PREROLL_MS = 1000           # 0.3초 평균으로 판단하는 만큼 시작 감지가 늦어서, 앞쪽을 넉넉히 붙여야 첫 마디가 안 잘림
+HALLUCINATIONS = {"감사합니다.", "시청해주셔서 감사합니다.", "MBC 뉴스 이덕영입니다.", "구독과 좋아요 부탁드립니다."}
+BRACKET_ONLY = re.compile(r"^(\s*[\[\(][^\]\)]*[\]\)]\s*)+$")
+
+
+def _bin(name: str) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in (Path.home() / ".local" / "bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin"),
+              Path.home() / ".grok" / "bin", Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin")):
+        if (d / name).exists():
+            return str(d / name)
+    return None
+
+
+def log(msg: str) -> None:
+    if os.environ.get("SCRIBE_DEBUG", "1") != "0":
+        print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+def _clean_env() -> dict:
+    # 이 서버가 Claude Code 세션 안에서 실행되면 CLAUDE_CODE_* 가 상속돼 `claude -p`가 오동작한다.
+    return {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE_CODE_")}
+
+
+# ---------- 장치 / 모델 / 프로바이더 탐지 ----------
+
+def list_audio_devices() -> list[dict]:
+    ffmpeg = _bin("ffmpeg")
+    if not ffmpeg:
+        return []
+    out = subprocess.run([ffmpeg, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                         capture_output=True, text=True).stderr
+    devices, in_audio = [], False
+    for line in out.splitlines():
+        if "audio devices" in line:
+            in_audio = True
+            continue
+        m = re.search(r"\[(\d+)\] (.+)$", line)
+        if in_audio and m:
+            devices.append({"id": m.group(1), "name": m.group(2).strip()})
+    return devices
+
+
+def default_device(devices: list[dict]) -> str | None:
+    for d in devices:
+        if "MacBook" in d["name"] or "내장" in d["name"] or "Built-in" in d["name"]:
+            return d["id"]
+    return devices[0]["id"] if devices else None
+
+
+def list_whisper_models() -> list[dict]:
+    models = []
+    for d in WHISPER_MODEL_DIRS:
+        for p in sorted(glob.glob(str(d / "ggml-*.bin"))):
+            name = Path(p).stem.replace("ggml-", "")
+            models.append({"id": p, "name": name})
+    return models
+
+
+def default_whisper_model(models: list[dict]) -> str | None:
+    rank = ["large-v3-turbo", "large-v3", "medium", "small", "base", "tiny"]
+    for r in rank:
+        for m in models:
+            if m["name"] == r:
+                return m["id"]
+    return models[0]["id"] if models else None
+
+
+# 요약·번역을 맡길 수 있는 모델들. 쓸 수 있는 것(설치된 CLI, 환경변수 API 키, 로컬 Ollama)만 드롭다운에 뜬다.
+# 새 프로바이더는 detect 목록에 한 줄, complete()에 분기 하나만 추가하면 된다.
+API_PROVIDERS = {
+    # id: (표시 이름, 키 환경변수, OpenAI 호환 엔드포인트, 모델 환경변수, 기본 모델)
+    "openai": ("OpenAI API", "OPENAI_API_KEY", "https://api.openai.com/v1/chat/completions", "OPENAI_MODEL", "gpt-5-mini"),
+    "xai": ("xAI Grok API", "XAI_API_KEY", "https://api.x.ai/v1/chat/completions", "XAI_MODEL", "grok-4"),
+}
+
+
+def detect_providers() -> list[dict]:
+    providers = []
+    claude = _bin("claude")
+    if claude:
+        try:
+            st = subprocess.run([claude, "auth", "status", "--json"], capture_output=True, text=True,
+                                timeout=15, env=_clean_env(), stdin=subprocess.DEVNULL)
+            info = json.loads(st.stdout or "{}")
+            if info.get("loggedIn"):
+                plan = info.get("subscriptionType") or ""
+                providers.append({"id": "claude", "name": f"Claude Code CLI ({plan}, 사용량 차감)"})
+        except Exception:
+            pass
+    if _bin("codex"):
+        providers.append({"id": "codex", "name": "Codex CLI (사용량 차감)"})
+    if _bin("grok"):
+        providers.append({"id": "grok", "name": "Grok Build CLI (사용량 차감)"})
+    if _bin("cursor-agent-cli") or _bin("agent"):
+        providers.append({"id": "cursor", "name": "Cursor Agent CLI (사용량 차감)"})
+    if _bin("gemini"):
+        providers.append({"id": "gemini", "name": "Gemini CLI (사용량 차감)"})
+    for pid, (name, key_env, _url, model_env, default_model) in API_PROVIDERS.items():
+        if os.environ.get(key_env):
+            providers.append({"id": pid, "name": f"{name} · {os.environ.get(model_env, default_model)} (과금)"})
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=2) as r:
+            for m in json.load(r).get("models", []):
+                providers.append({"id": f"ollama:{m['name']}", "name": f"Ollama · {m['name']} (로컬, 무료)"})
+    except Exception:
+        pass
+    providers.append({"id": "off", "name": "끄기"})
+    return providers
+
+
+def default_provider(providers: list[dict]) -> str:
+    ids = [p["id"] for p in providers]
+    # 실측해보니 소형 로컬 모델(llama3.2:3b)은 음성인식 오타가 섞인 한국어를 받으면 다른 언어를 섞거나
+    # 내용을 지어내서, 품질이 확인된 순서로 고른다. 로컬은 다른 게 없을 때의 대안.
+    for pid in ("claude", "codex", "grok", "cursor", "gemini", "openai", "xai"):
+        if pid in ids:
+            return pid
+    local = [i for i in ids if i.startswith("ollama:") and "r1" not in i] or [i for i in ids if i.startswith("ollama:")]
+    return local[0] if local else "off"
+
+
+def _run_cli(cmd: list[str], timeout: int, name: str) -> str:
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_clean_env(), cwd=WORK_DIR,
+                       stdin=subprocess.DEVNULL)
+    if r.returncode != 0 or not r.stdout.strip():
+        raise RuntimeError((r.stderr or r.stdout).strip()[-300:] or f"{name} 실패")
+    return r.stdout.strip()
+
+
+def complete(provider: str, prompt: str, timeout: int = 180) -> str:
+    """프로바이더에 프롬프트 하나를 보내고 텍스트 답을 받는다."""
+    if provider == "grok":
+        return _run_cli([_bin("grok"), "-p", prompt, "--output-format", "plain"], timeout, "grok")
+    if provider == "cursor":
+        return _run_cli([_bin("cursor-agent-cli") or _bin("agent"), "-p", prompt, "--output-format", "text", "--trust"],
+                        timeout, "cursor")
+    if provider == "claude":
+        return _run_cli([_bin("claude"), "-p", prompt, "--output-format", "text"], timeout, "claude")
+    if provider == "codex":
+        with tempfile.NamedTemporaryFile("r", suffix=".txt", delete=False) as out:
+            out_path = out.name
+        try:
+            WORK_DIR.mkdir(parents=True, exist_ok=True)
+            r = subprocess.run([_bin("codex"), "exec", "--skip-git-repo-check", "--output-last-message", out_path, prompt],
+                               capture_output=True, text=True, timeout=timeout, env=_clean_env(), cwd=WORK_DIR,
+                               stdin=subprocess.DEVNULL)
+            text = Path(out_path).read_text(encoding="utf-8").strip() if os.path.exists(out_path) else ""
+        finally:
+            Path(out_path).unlink(missing_ok=True)
+        if not text:
+            raise RuntimeError((r.stderr or r.stdout).strip()[:300] or "codex 실패")
+        return text
+    if provider == "gemini":
+        return _run_cli([_bin("gemini"), "-p", prompt], timeout, "gemini")
+    if provider in API_PROVIDERS:
+        _name, key_env, url, model_env, default_model = API_PROVIDERS[provider]
+        body = json.dumps({"model": os.environ.get(model_env, default_model),
+                           "messages": [{"role": "user", "content": prompt}]}).encode()
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json",
+                                                              "Authorization": f"Bearer {os.environ[key_env]}"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)["choices"][0]["message"]["content"].strip()
+    if provider.startswith("ollama:"):
+        body = json.dumps({"model": provider.split(":", 1)[1], "prompt": prompt, "stream": False}).encode()
+        req = urllib.request.Request(f"{OLLAMA_URL}/api/generate", data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            text = json.load(r).get("response", "")
+        return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    raise RuntimeError("꺼져 있음")
+
+
+# ---------- 요약 ----------
+
+SUMMARY_PROMPT = """너는 회의록 작성자다. 아래는 지금까지 정리된 회의 요약과, 그 뒤에 새로 받아적은 내용이다.
+새 내용을 반영해서 회의 전체 요약을 다시 써라.
+
+규칙:
+- 받아적기에 없는 내용은 지어내지 않는다.
+- 음성인식 오류로 보이는 부분은 문맥으로 해석하되, 확실하지 않으면 뺀다.
+- 형식은 아래 세 덩어리만. 해당 내용이 없으면 그 덩어리는 생략한다.
+  ## 핵심 논의
+  ## 결정 사항
+  ## 할 일 (담당자·기한이 언급된 경우만)
+- 요약 본문만 출력한다. 인사말이나 설명은 쓰지 않는다.
+
+[지금까지의 요약]
+{previous}
+
+[새로 받아적은 내용]
+{delta}
+"""
+
+
+def _glossary_note(glossary: str) -> str:
+    g = glossary.strip()
+    return f"\n참고: 이 회의에 자주 나오는 이름·용어는 다음과 같다. 비슷하게 받아적힌 말은 이 표기로 바로잡아라: {g}\n" if g else ""
+
+
+def summarize(provider: str, previous: str, delta: str, glossary: str = "") -> str:
+    prompt = SUMMARY_PROMPT.format(previous=previous or "(아직 없음)", delta=delta) + _glossary_note(glossary)
+    return complete(provider, prompt)
+
+
+LANGUAGES = {"zh": "중국어 간체(简体中文)", "en": "영어"}
+
+TRANSLATE_PROMPT = """아래는 회의를 음성인식으로 받아적은 한국어 문장들이다. 각 문장을 {lang}로 번역해라.
+음성인식 오타는 문맥으로 바로잡아 번역한다. 사람 이름은 원문 발음을 살린다.
+번호를 그대로 유지해서 "번호. 번역문" 형식으로 한 줄씩만 출력하고, 다른 말은 쓰지 않는다.
+
+{numbered}
+"""
+
+TRANSLATE_SUMMARY_PROMPT = """아래 회의 요약을 {lang}로 번역해라. 마크다운 제목(##)과 목록 형식은 그대로 유지하고, 번역문만 출력한다.
+
+{text}
+"""
+
+
+def translate_lines(provider: str, lang: str, texts: list[str], glossary: str = "") -> list[str]:
+    numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
+    prompt = TRANSLATE_PROMPT.format(lang=LANGUAGES[lang], numbered=numbered) + _glossary_note(glossary)
+    out = complete(provider, prompt, timeout=120)
+    result = [""] * len(texts)
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+)[.)]\s*(.*)", line)
+        if m and 1 <= int(m.group(1)) <= len(texts):
+            result[int(m.group(1)) - 1] = m.group(2).strip()
+    return result
+
+
+def translate_summary(provider: str, lang: str, text: str) -> str:
+    return complete(provider, TRANSLATE_SUMMARY_PROMPT.format(lang=LANGUAGES[lang], text=text))
+
+
+def post_webhook(url: str, title: str, markdown: str) -> None:
+    body = json.dumps({"msgtype": "markdown", "markdown": {"title": title, "text": markdown}}).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=10).read()
+
+
+# ---------- 이벤트 브로드캐스트 (SSE) ----------
+
+class Channel:
+    def __init__(self) -> None:
+        self._subs: list[queue.Queue] = []
+        self._lock = threading.Lock()
+
+    def subscribe(self) -> queue.Queue:
+        q: queue.Queue = queue.Queue()
+        with self._lock:
+            self._subs.append(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue) -> None:
+        with self._lock:
+            if q in self._subs:
+                self._subs.remove(q)
+
+    def publish(self, event: dict) -> None:
+        with self._lock:
+            for q in self._subs:
+                q.put(event)
+
+
+# ---------- 녹음 세션 ----------
+
+def _frame_rms(frame: bytes) -> float:
+    samples = array.array("h", frame)
+    if not samples:
+        return 0.0
+    return (sum(x * x for x in samples) / len(samples)) ** 0.5
+
+
+def _write_wav(path: Path, pcm: bytes) -> None:
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(pcm)
+
+
+class Scribe:
+    def __init__(self) -> None:
+        self.transcript_ch = Channel()
+        self.summary_ch = Channel()
+        self.status_ch = Channel()
+        self.lock = threading.Lock()
+        self.devices = list_audio_devices()
+        self.models = list_whisper_models()
+        self.providers = detect_providers()
+        self.config = {
+            "device": default_device(self.devices),
+            "model": default_whisper_model(self.models),
+            "provider": default_provider(self.providers),
+            "interval": 60,
+            "language": "ko",
+            "webhook": "",
+            "translate": "off",
+            "glossary": "",
+        }
+        self.auto_provider = self.config["provider"]
+        self.recording = False
+        self.lines: list[dict] = []
+        self.summary = ""
+        self.summary_at = 0.0
+        self.summarized_upto = 0
+        self.summary_error = ""
+        self.summary_tr = ""
+        self._tr_wake = threading.Event()
+        self._tr_lock = threading.Lock()
+        self.session_dir: Path | None = None
+        self.files: dict[str, Path] = {}
+        self.ffmpeg: subprocess.Popen | None = None
+        self._stop = threading.Event()
+        self._summarizing = threading.Lock()
+
+    # --- 상태 ---
+
+    def state(self) -> dict:
+        return {
+            "recording": self.recording,
+            "config": self.config,
+            "auto_provider": self.auto_provider,
+            "devices": self.devices,
+            "models": self.models,
+            "providers": self.providers,
+            "lines": self.lines,
+            "summary": self.summary,
+            "summary_at": self.summary_at,
+            "summary_error": self.summary_error,
+            "summary_tr": self.summary_tr,
+            "languages": [{"id": "off", "name": "끄기"}] + [{"id": k, "name": v} for k, v in LANGUAGES.items()],
+            "files": {k: str(v) for k, v in self.files.items()},
+        }
+
+    def refresh_sources(self) -> None:
+        self.devices = list_audio_devices()
+        self.models = list_whisper_models()
+        self.providers = detect_providers()
+        self.auto_provider = default_provider(self.providers)
+        self.status_ch.publish({"type": "sources"})
+
+    def set_config(self, patch: dict) -> None:
+        with self.lock:
+            for k in ("device", "model", "provider", "language", "webhook", "glossary"):
+                if k in patch:
+                    self.config[k] = patch[k]
+            if "translate" in patch and patch["translate"] != self.config["translate"]:
+                self.config["translate"] = patch["translate"]
+                for line in self.lines:  # 언어가 바뀌면 기존 번역은 버리고 다시 번역
+                    line.pop("tr", None)
+                self.summary_tr = ""
+                self._tr_wake.set()
+                self.transcript_ch.publish({"type": "reset_translations"})
+                threading.Thread(target=self._retranslate, daemon=True).start()
+            if "interval" in patch:
+                self.config["interval"] = max(15, int(patch["interval"]))
+        self.status_ch.publish({"type": "config"})
+
+    # --- 시작 / 종료 ---
+
+    def start(self) -> None:
+        with self.lock:
+            if self.recording:
+                return
+            if not self.config["device"] or not self.config["model"]:
+                raise RuntimeError("마이크 또는 음성인식 모델이 없습니다")
+            stamp = time.strftime("%Y%m%d-%H%M")
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            self.files = {"transcript": DATA_DIR / f"{stamp}-받아적기.txt", "summary": DATA_DIR / f"{stamp}-요약.md",
+                          "translation": DATA_DIR / f"{stamp}-번역.txt"}
+            self.session_dir = Path(tempfile.mkdtemp(prefix="scribe-"))
+            self.lines, self.summary, self.summary_at, self.summarized_upto, self.summary_error = [], "", 0.0, 0, ""
+            self.summary_tr = ""
+            self._stop.clear()
+            self.segments: queue.Queue = queue.Queue()
+            ffmpeg = _bin("ffmpeg")
+            self.ffmpeg = subprocess.Popen(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "avfoundation", "-i", f":{self.config['device']}",
+                 "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.recording = True
+        threading.Thread(target=self._capture_loop, daemon=True).start()
+        threading.Thread(target=self._transcribe_loop, daemon=True).start()
+        threading.Thread(target=self._summary_loop, daemon=True).start()
+        threading.Thread(target=self._translate_loop, daemon=True).start()
+        self.status_ch.publish({"type": "recording", "recording": True})
+
+    def stop(self) -> None:
+        with self.lock:
+            if not self.recording:
+                return
+            self.recording = False
+            if self.ffmpeg and self.ffmpeg.poll() is None:
+                self.ffmpeg.send_signal(signal.SIGINT)
+                try:
+                    self.ffmpeg.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.ffmpeg.kill()
+        self._stop.set()
+        self.status_ch.publish({"type": "recording", "recording": False})
+
+    # --- 받아적기 ---
+
+    def _capture_loop(self) -> None:
+        frame_bytes = SAMPLE_RATE * FRAME_MS // 1000 * 2
+        noise = 200.0
+        preroll: list[bytes] = []
+        seg: list[bytes] = []
+        speech_ms = silence_ms = 0
+        idx = 0
+
+        def flush() -> None:
+            nonlocal seg, speech_ms, silence_ms, idx
+            if seg:
+                log(f"segment {len(seg) * FRAME_MS}ms speech={speech_ms}ms noise={noise:.0f} {'drop' if speech_ms < MIN_SPEECH_MS else 'keep'}")
+            if seg and speech_ms >= MIN_SPEECH_MS:
+                idx += 1
+                path = self.session_dir / f"seg_{idx:05d}.wav"
+                _write_wav(path, b"".join(seg))
+                self.segments.put(path)
+            seg, speech_ms, silence_ms = [], 0, 0
+
+        stdout = self.ffmpeg.stdout
+        recent: list[float] = []
+        history: list[float] = []
+        n = 0
+        while True:
+            frame = stdout.read(frame_bytes)
+            if not frame or len(frame) < frame_bytes:
+                break
+            rms = _frame_rms(frame)
+            recent = (recent + [rms])[-SMOOTH_FRAMES:]
+            history = (history + [rms])[-NOISE_WINDOW_FRAMES:]
+            n += 1
+            if n % 33 == 0 and len(history) >= 33:
+                noise = sorted(history)[len(history) // 10]
+            level = sum(recent) / len(recent)
+            speaking = level > max(MIN_SPEECH_RMS, noise * NOISE_MULTIPLIER)
+            if seg:
+                seg.append(frame)
+                if speaking:
+                    speech_ms += FRAME_MS
+                    silence_ms = 0
+                else:
+                    silence_ms += FRAME_MS
+                if silence_ms >= END_SILENCE_MS or len(seg) * FRAME_MS >= MAX_SEGMENT_MS:
+                    flush()
+            elif speaking:
+                seg = preroll + [frame]
+                speech_ms, silence_ms = FRAME_MS, 0
+            preroll = (preroll + [frame])[-(PREROLL_MS // FRAME_MS):]
+        flush()
+        self.segments.put(None)
+        if self.recording:
+            err = (self.ffmpeg.stderr.read() or b"").decode(errors="ignore").strip()
+            self.recording = False
+            self._stop.set()
+            self.status_ch.publish({"type": "error", "message": f"녹음이 멈췄습니다: {err[:200] or '마이크 권한을 확인하세요'}"})
+            self.status_ch.publish({"type": "recording", "recording": False})
+
+    def _transcribe_loop(self) -> None:
+        while True:
+            path = self.segments.get()
+            if path is None:
+                break
+            try:
+                self._transcribe_segment(path)
+            finally:
+                path.unlink(missing_ok=True)
+        self._summarize_now(final=True)
+        shutil.rmtree(self.session_dir, ignore_errors=True)
+
+    def _transcribe_segment(self, path: Path) -> None:
+        whisper = _bin("whisper-cli")
+        lang = self.config["language"] or "auto"
+        cmd = [whisper, "-m", self.config["model"], "-l", lang, "-f", str(path), "-nt", "-np"]
+        # 직전 문장을 힌트로 주면 잡음 구간에서 그 문장을 변형해 베껴 쓰는 걸 확인해서, 사용자가 넣은 이름·용어만 힌트로 준다.
+        if self.config["glossary"].strip():
+            cmd += ["--prompt", self.config["glossary"].strip()[:300]]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        text = " ".join(t.strip() for t in r.stdout.splitlines() if t.strip())
+        log(f"stt {path.name}: {text[:80]!r}")
+        if not text or text in HALLUCINATIONS or BRACKET_ONLY.match(text):
+            return
+        if self.lines and text == self.lines[-1]["text"]:
+            return  # 같은 문장이 연달아 나오면 잡음에서 지어낸 것
+        if self._echoes_glossary(text):
+            return  # 소리가 약하면 whisper가 힌트로 준 용어 목록을 그대로 내뱉는다
+        with self.lock:
+            line = {"id": len(self.lines), "t": time.strftime("%H:%M:%S"), "text": text}
+            self.lines.append(line)
+            with open(self.files["transcript"], "a", encoding="utf-8") as f:
+                f.write(f"[{line['t']}] {text}\n")
+        self.transcript_ch.publish({"type": "line", **line})
+        self._tr_wake.set()
+
+    def _echoes_glossary(self, text: str) -> bool:
+        terms = {t for t in re.split(r"[,\s·/]+", self.config["glossary"]) if t}
+        words = [w for w in re.split(r"[,\s·/.!?]+", text) if w]
+        if not terms or not words:
+            return False
+        return sum(w in terms for w in words) / len(words) >= 0.5
+
+    # --- 번역 ---
+
+    def _translate_loop(self) -> None:
+        while not self._stop.is_set() or self._tr_pending():
+            self._tr_wake.wait(2)
+            self._tr_wake.clear()
+            self._translate_pending()
+        self._translate_pending()
+
+    def _retranslate(self) -> None:
+        # 녹음이 끝난 뒤에 언어를 바꿔도 지금까지 받아적은 것과 요약이 번역되게.
+        self._translate_pending()
+        lang, provider, text = self.config["translate"], self.config["provider"], self.summary
+        if lang != "off" and provider != "off" and text:
+            try:
+                self.summary_tr = translate_summary(provider, lang, text)
+                self.summary_ch.publish({"type": "summary_tr", "text": self.summary_tr, "lang": lang})
+            except Exception as e:
+                self.summary_ch.publish({"type": "error", "message": f"요약 번역 실패: {str(e)[:200]}"})
+
+    def _tr_pending(self) -> bool:
+        return self.config["translate"] != "off" and any("tr" not in l for l in self.lines)
+
+    def _translate_pending(self) -> None:
+        lang, provider = self.config["translate"], self.config["provider"]
+        if lang == "off" or provider == "off":
+            return
+        with self._tr_lock:
+            while True:
+                with self.lock:
+                    batch = [l for l in self.lines if "tr" not in l][:10]
+                if not batch:
+                    return
+                try:
+                    out = translate_lines(provider, lang, [l["text"] for l in batch], self.config["glossary"])
+                except Exception as e:
+                    self.transcript_ch.publish({"type": "error", "message": f"번역 실패: {str(e)[:200]}"})
+                    return
+                if lang != self.config["translate"]:
+                    return  # 도중에 언어가 바뀜
+                with self.lock:
+                    for l, tr in zip(batch, out):
+                        l["tr"] = tr
+                    with open(self.files["translation"], "a", encoding="utf-8") as f:
+                        for l in batch:
+                            f.write(f"[{l['t']}] {l['text']}\n          {l['tr']}\n")
+                for l in batch:
+                    self.transcript_ch.publish({"type": "translation", "id": l["id"], "text": l["tr"]})
+
+    # --- 요약 ---
+
+    def _summary_loop(self) -> None:
+        last = time.time()
+        while not self._stop.wait(1):
+            if time.time() - last >= self.config["interval"]:
+                last = time.time()
+                threading.Thread(target=self._summarize_now, daemon=True).start()
+
+    def _summarize_now(self, final: bool = False) -> None:
+        provider = self.config["provider"]
+        if provider == "off":
+            return
+        if not self._summarizing.acquire(blocking=final):
+            return  # 이전 요약이 아직 도는 중
+        try:
+            with self.lock:
+                new = self.lines[self.summarized_upto:]
+                upto = len(self.lines)
+                previous = self.summary
+            if not new:
+                return
+            delta = "\n".join(f"[{l['t']}] {l['text']}" for l in new)
+            self.summary_ch.publish({"type": "working", "provider": provider})
+            try:
+                text = summarize(provider, previous, delta, self.config["glossary"])
+            except Exception as e:
+                self.summary_error = str(e)
+                self.summary_ch.publish({"type": "error", "message": self.summary_error})
+                return
+            with self.lock:
+                self.summary, self.summarized_upto, self.summary_at, self.summary_error = text, upto, time.time(), ""
+                self.files["summary"].write_text(text + "\n", encoding="utf-8")
+            self.summary_ch.publish({"type": "summary", "text": text, "at": self.summary_at, "provider": provider, "final": final})
+            lang = self.config["translate"]
+            if lang != "off":
+                try:
+                    self.summary_tr = translate_summary(provider, lang, text)
+                    self.summary_ch.publish({"type": "summary_tr", "text": self.summary_tr, "lang": lang})
+                except Exception as e:
+                    self.summary_ch.publish({"type": "error", "message": f"요약 번역 실패: {str(e)[:200]}"})
+            if self.config["webhook"]:
+                try:
+                    body = text + (f"\n\n---\n\n{self.summary_tr}" if lang != "off" and self.summary_tr else "")
+                    post_webhook(self.config["webhook"], "회의 요약" + (" (최종)" if final else ""), body)
+                except Exception as e:
+                    self.summary_ch.publish({"type": "error", "message": f"웹훅 전송 실패: {e}"})
+        finally:
+            self._summarizing.release()
+
+
+SCRIBE: Scribe | None = None
+
+
+# ---------- HTTP ----------
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args) -> None:
+        pass
+
+    def _json(self, obj, code: int = 200) -> None:
+        data = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _body(self) -> dict:
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}") if n else {}
+
+    def _sse(self, channel: Channel) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        q = channel.subscribe()
+        try:
+            self.wfile.write(b": ok\n\n")
+            self.wfile.flush()
+            while True:
+                try:
+                    ev = q.get(timeout=15)
+                    self.wfile.write(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode())
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            channel.unsubscribe(q)
+
+    def do_GET(self) -> None:
+        if self.path in ("/", "/index.html"):
+            data = (HERE / "index.html").read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        elif self.path == "/api/state":
+            self._json(SCRIBE.state())
+        elif self.path == "/events/transcript":
+            self._sse(SCRIBE.transcript_ch)
+        elif self.path == "/events/summary":
+            self._sse(SCRIBE.summary_ch)
+        elif self.path == "/events/status":
+            self._sse(SCRIBE.status_ch)
+        else:
+            self._json({"error": "not found"}, 404)
+
+    def do_POST(self) -> None:
+        try:
+            if self.path == "/api/start":
+                SCRIBE.start()
+            elif self.path == "/api/stop":
+                SCRIBE.stop()
+            elif self.path == "/api/config":
+                SCRIBE.set_config(self._body())
+            elif self.path == "/api/refresh":
+                SCRIBE.refresh_sources()
+            elif self.path == "/api/summarize":
+                threading.Thread(target=SCRIBE._summarize_now, daemon=True).start()
+            else:
+                return self._json({"error": "not found"}, 404)
+            self._json(SCRIBE.state())
+        except Exception as e:
+            self._json({"error": str(e)}, 400)
+
+
+def main() -> None:
+    global SCRIBE
+    for tool in ("ffmpeg", "whisper-cli"):
+        if not _bin(tool):
+            raise SystemExit(f"{tool} 가 필요합니다: brew install {'ffmpeg' if tool == 'ffmpeg' else 'whisper-cpp'}")
+    SCRIBE = Scribe()
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    print(f"Meeting Scribe: http://localhost:{PORT}  (저장 위치: {DATA_DIR})")
+    print(f"요약 프로바이더 자동 선택: {SCRIBE.auto_provider}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        SCRIBE.stop()
+
+
+if __name__ == "__main__":
+    main()

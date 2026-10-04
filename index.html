@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meeting Scribe</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #6e6e73; --line: #e4e2dd;
+    --accent: #d97706; --rec: #dc2626; --ok: #15803d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161616; --panel: #202020; --ink: #ececec; --muted: #9a9a9a; --line: #333; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", sans-serif; height: 100vh;
+         display: flex; flex-direction: column; }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 12px 18px;
+           border-bottom: 1px solid var(--line); background: var(--panel); }
+  h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 650; }
+  label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  select, input[type=text] { font: inherit; font-size: 13px; color: var(--ink); background: var(--bg);
+           border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px; max-width: 260px; }
+  button { font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+           border-radius: 7px; padding: 6px 12px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary.stop { background: var(--rec); border-color: var(--rec); }
+  .spacer { flex: 1; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.on { background: var(--rec); animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 14px 18px; min-height: 0; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+            display: flex; flex-direction: column; min-height: 0; }
+  section > .head { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--line); }
+  section > .head h2 { font-size: 13px; margin: 0; font-weight: 650; }
+  section > .head .meta { color: var(--muted); font-size: 12px; }
+  .body { flex: 1; overflow: auto; padding: 12px 14px; }
+  .line { display: grid; grid-template-columns: 64px 1fr; gap: 8px; padding: 3px 0; }
+  .line .t { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; padding-top: 1px; }
+  .line .tr { display: block; color: var(--muted); font-size: 13px; margin-top: 1px; }
+  .line .tr:empty { display: none; }
+  #summaryTr { border-top: 1px dashed var(--line); margin-top: 14px; padding-top: 12px; }
+  #summaryTr:empty { display: none; }
+  #summaryTr h2 { font-size: 14px; margin: 14px 0 6px; }
+  #summaryTr h2:first-child { margin-top: 0; }
+  #summaryTr ul { margin: 0; padding-left: 18px; }
+  #summaryTr p { margin: 6px 0; }
+  .empty { color: var(--muted); }
+  #summary h2 { font-size: 14px; margin: 14px 0 6px; }
+  #summary h2:first-child { margin-top: 0; }
+  #summary ul { margin: 0; padding-left: 18px; }
+  #summary p { margin: 6px 0; }
+  .err { color: var(--rec); font-size: 12px; }
+  .note { color: var(--muted); font-size: 12px; padding: 0 18px 12px; }
+  details { color: var(--muted); font-size: 12px; }
+  details input { width: 340px; max-width: 100%; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="dot" id="dot"></span> Meeting Scribe</h1>
+  <label>마이크 <select id="device"></select></label>
+  <label>받아적기 모델 <select id="model"></select></label>
+  <label>요약·번역 모델 <select id="provider"></select></label>
+  <label>번역 <select id="translate"></select></label>
+  <label>요약 주기
+    <select id="interval">
+      <option value="30">30초</option><option value="60">1분</option><option value="120">2분</option><option value="300">5분</option>
+    </select>
+  </label>
+  <div class="spacer"></div>
+  <button id="refresh" title="마이크·모델·프로바이더 다시 찾기">다시 찾기</button>
+  <button id="toggle" class="primary">녹음 시작</button>
+</header>
+
+<main>
+  <section>
+    <div class="head"><h2>받아적기</h2><span class="meta" id="tmeta"></span></div>
+    <div class="body" id="transcript"><div class="empty">녹음을 시작하면 여기에 실시간으로 받아적습니다.</div></div>
+  </section>
+  <section>
+    <div class="head"><h2>요약</h2><span class="meta" id="smeta"></span>
+      <div class="spacer"></div><button id="now">지금 요약</button></div>
+    <div class="body"><div id="summary"><div class="empty">받아적은 내용이 쌓이면 주기마다 요약을 갱신합니다.</div></div>
+      <div id="summaryTr"></div>
+      <div class="err" id="serr"></div></div>
+  </section>
+</main>
+<div class="note">
+  <span id="files"></span>
+  <label style="margin:6px 0">자주 나오는 이름·용어
+    <input type="text" id="glossary" style="width:420px;max-width:100%" placeholder="예: 사람 이름, 제품명, 약어">
+  </label>
+  <details><summary>딩톡으로도 올리기 (선택)</summary>
+    단톡방 커스텀 봇 웹훅 주소를 넣으면 요약이 바뀔 때마다 올립니다.
+    <input type="text" id="webhook" placeholder="https://oapi.dingtalk.com/robot/send?access_token=...">
+  </details>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let state = null;
+
+function fill(sel, items, current, autoId) {
+  sel.innerHTML = "";
+  for (const it of items) {
+    const o = document.createElement("option");
+    o.value = it.id;
+    o.textContent = it.name + (autoId && it.id === autoId ? "  · 자동 선택" : "");
+    sel.appendChild(o);
+  }
+  if (current != null) sel.value = current;
+}
+
+function renderControls() {
+  const c = state.config;
+  fill($("device"), state.devices, c.device);
+  fill($("model"), state.models, c.model);
+  fill($("provider"), state.providers, c.provider, state.auto_provider);
+  fill($("translate"), state.languages, c.translate);
+  $("interval").value = String(c.interval);
+  if (document.activeElement !== $("webhook")) $("webhook").value = c.webhook || "";
+  if (document.activeElement !== $("glossary")) $("glossary").value = c.glossary || "";
+  const rec = state.recording;
+  $("toggle").textContent = rec ? "녹음 중지" : "녹음 시작";
+  $("toggle").classList.toggle("stop", rec);
+  $("dot").classList.toggle("on", rec);
+  for (const id of ["device", "model"]) $(id).disabled = rec;
+  const f = state.files || {};
+  $("files").textContent = f.transcript ? `저장: ${f.transcript}  ·  ${f.summary}` : "";
+}
+
+function addLine(l) {
+  const box = $("transcript");
+  if (box.querySelector(".empty")) box.innerHTML = "";
+  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  const row = document.createElement("div");
+  row.className = "line";
+  row.dataset.id = l.id;
+  row.innerHTML = `<span class="t"></span><span><span class="x"></span><span class="tr"></span></span>`;
+  row.querySelector(".t").textContent = l.t;
+  row.querySelector(".x").textContent = l.text;
+  row.querySelector(".tr").textContent = l.tr || "";
+  box.appendChild(row);
+  if (stick) box.scrollTop = box.scrollHeight;
+  $("tmeta").textContent = `${box.querySelectorAll(".line").length}줄`;
+}
+
+function md(text) {
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  let html = "", inList = false;
+  for (const raw of text.split("\n")) {
+    const line = raw.trimEnd();
+    const li = line.match(/^\s*[-*•]\s+(.*)/);
+    if (li) { if (!inList) { html += "<ul>"; inList = true; } html += `<li>${esc(li[1])}</li>`; continue; }
+    if (inList) { html += "</ul>"; inList = false; }
+    const h = line.match(/^#{1,4}\s+(.*)/);
+    if (h) html += `<h2>${esc(h[1])}</h2>`;
+    else if (line.trim()) html += `<p>${esc(line)}</p>`;
+  }
+  if (inList) html += "</ul>";
+  return html.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
+}
+
+function setSummary(text, at, provider) {
+  $("summary").innerHTML = text ? md(text) : '<div class="empty">받아적은 내용이 쌓이면 주기마다 요약을 갱신합니다.</div>';
+  if (at) $("smeta").textContent = `${new Date(at * 1000).toLocaleTimeString("ko-KR")} 갱신` + (provider ? ` · ${providerName(provider)}` : "");
+}
+
+function providerName(id) {
+  const p = (state?.providers || []).find((x) => x.id === id);
+  return p ? p.name.split(" (")[0] : id;
+}
+
+async function load() {
+  state = await (await fetch("/api/state")).json();
+  renderControls();
+  $("transcript").innerHTML = state.lines.length ? "" : $("transcript").innerHTML;
+  state.lines.forEach(addLine);
+  setSummary(state.summary, state.summary_at, state.config.provider);
+  $("summaryTr").innerHTML = state.summary_tr ? md(state.summary_tr) : "";
+  $("serr").textContent = state.summary_error || "";
+}
+
+async function post(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  const j = await r.json();
+  if (j.error) { alert(j.error); return; }
+  state = j; renderControls();
+}
+
+for (const id of ["device", "model", "provider", "interval", "translate"]) {
+  $(id).addEventListener("change", () => post("/api/config", { [id]: id === "interval" ? Number($(id).value) : $(id).value }));
+}
+$("webhook").addEventListener("change", () => post("/api/config", { webhook: $("webhook").value.trim() }));
+$("glossary").addEventListener("change", () => post("/api/config", { glossary: $("glossary").value.trim() }));
+$("refresh").addEventListener("click", () => post("/api/refresh"));
+$("now").addEventListener("click", () => post("/api/summarize"));
+$("toggle").addEventListener("click", async () => {
+  if (state.recording) return post("/api/stop");
+  $("transcript").innerHTML = '<div class="empty">듣는 중… (10초 단위로 받아적습니다)</div>';
+  setSummary("", 0); $("summaryTr").innerHTML = ""; $("smeta").textContent = ""; $("tmeta").textContent = ""; $("serr").textContent = "";
+  await post("/api/start");
+});
+
+new EventSource("/events/transcript").onmessage = (e) => {
+  const ev = JSON.parse(e.data);
+  if (ev.type === "line") addLine(ev);
+  if (ev.type === "translation") {
+    const el = document.querySelector(`.line[data-id="${ev.id}"] .tr`);
+    if (el) el.textContent = ev.text;
+  }
+  if (ev.type === "reset_translations") document.querySelectorAll(".line .tr").forEach((el) => (el.textContent = ""));
+  if (ev.type === "error") $("serr").textContent = ev.message;
+};
+new EventSource("/events/summary").onmessage = (e) => {
+  const ev = JSON.parse(e.data);
+  if (ev.type === "working") $("smeta").textContent = `요약 중… (${providerName(ev.provider)})`;
+  if (ev.type === "summary") { setSummary(ev.text, ev.at, ev.provider); $("serr").textContent = ""; }
+  if (ev.type === "summary_tr") $("summaryTr").innerHTML = md(ev.text);
+  if (ev.type === "error") { $("serr").textContent = ev.message; $("smeta").textContent = ""; }
+};
+new EventSource("/events/status").onmessage = async (e) => {
+  const ev = JSON.parse(e.data);
+  if (ev.type === "error") alert(ev.message);
+  state = await (await fetch("/api/state")).json();
+  renderControls();
+};
+
+load();
+</script>
+</body>
+</html>
