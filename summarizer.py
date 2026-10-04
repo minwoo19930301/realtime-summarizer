@@ -469,6 +469,8 @@ class Summarizer:
         self.digest_upto = 0             # 구간 요약에 들어간 줄 수
         self.digest_from = 0.0           # 다음 구간의 시작 시각
         self._digesting = threading.Lock()
+        self.session = 0                 # 녹음을 시작할 때마다 1씩: 이전 녹음의 늦은 결과가 새 녹음에 섞이지 않게
+        self._draft_lock = threading.Lock()
         self._load_draft()
 
     # --- 상태 ---
@@ -530,6 +532,7 @@ class Summarizer:
             apple = self.config["model"] == "apple"
             if apple and not ensure_apple_stt():
                 raise RuntimeError("실시간 받아쓰기 도우미(bin/apple-stt)를 만들 수 없습니다. 받아적기 모델을 whisper로 바꾸세요")
+            self.session += 1
             self.started_at = time.time()
             self.saved, self.saved_files = True, {}
             self.session_dir = Path(tempfile.mkdtemp(prefix="summarizer-"))
@@ -589,6 +592,9 @@ class Summarizer:
         speech_ms = silence_ms = 0
         idx = 0
         dead, backlog = None, []  # 실시간 도우미가 죽어 다시 뜨는 동안의 소리 (새 도우미에 이어서 넣는다)
+        # 이 녹음의 것만 붙잡는다: 멈추자마자 다시 시작하면 새 녹음이 이 값들을 바꾸기 때문
+        gen, ffmpeg, segments, session_dir = self.session, self.ffmpeg, self.segments, self.session_dir
+        stt = self.stt
 
         def flush() -> None:
             nonlocal seg, speech_ms, silence_ms, idx
@@ -596,18 +602,18 @@ class Summarizer:
                 log(f"segment {len(seg) * FRAME_MS}ms speech={speech_ms}ms noise={noise:.0f} {'drop' if speech_ms < MIN_SPEECH_MS else 'keep'}")
             if seg and speech_ms >= MIN_SPEECH_MS:
                 idx += 1
-                path = self.session_dir / f"seg_{idx:05d}.wav"
+                path = session_dir / f"seg_{idx:05d}.wav"
                 _write_wav(path, b"".join(seg))
-                self.segments.put(path)
+                segments.put(path)
             seg, speech_ms, silence_ms = [], 0, 0
 
-        stdout = self.ffmpeg.stdout
+        stdout = ffmpeg.stdout
         recent: list[float] = []
         history: list[float] = []
         n = 0
         while True:
             frame = stdout.read(frame_bytes)
-            if not frame or len(frame) < frame_bytes:
+            if not frame or len(frame) < frame_bytes or self.session != gen:
                 break
             rms = _frame_rms(frame)
             recent = (recent + [rms])[-SMOOTH_FRAMES:]
@@ -621,7 +627,10 @@ class Summarizer:
             if n % 10 == 0:  # 약 0.3초마다 화면에 입력 크기를 알려 "듣고 있는지"를 보이게 한다
                 self.status_ch.publish({"type": "level", "level": round(level), "threshold": round(threshold),
                                         "speaking": speaking})
-            stt = self.stt
+            cur = self.stt  # 세션 번호보다 먼저 읽는다: start()는 번호를 올린 뒤에 도우미를 바꾸므로 새 녹음의 도우미를 잡지 않는다
+            if self.session != gen:
+                break
+            stt = cur or stt
             if stt:  # 실시간 엔진: 무음 분할 없이 소리를 그대로 흘려 넣는다
                 if stt is dead:
                     backlog = (backlog + [frame])[-STT_BACKLOG_FRAMES:]
@@ -648,31 +657,37 @@ class Summarizer:
                 seg = preroll + [frame]
                 speech_ms, silence_ms = FRAME_MS, 0
             preroll = (preroll + [frame])[-(PREROLL_MS // FRAME_MS):]
-        if self.stt:
+        if stt:
             with self.lock:  # 도우미를 다시 띄우는 중이면 새 도우미에도 입력 끝을 알리도록 잠금 안에서
-                self._stt_eof = True
+                if self.session == gen:
+                    self._stt_eof = True
+                    stt = self.stt
                 try:
-                    self.stt.stdin.close()  # 입력 끝 → 도우미가 남은 소리를 확정하고 끝낸다
+                    stt.stdin.close()  # 입력 끝 → 도우미가 남은 소리를 확정하고 끝낸다
                 except OSError:
                     pass
         else:
             flush()
-            self.segments.put(None)
-        if self.recording and TEST_INPUT:
+            segments.put(None)
+        with self.lock:
+            mine = self.session == gen and self.recording
+            if mine:
+                self.recording = False
+        if not mine:
+            return  # 사용자가 멈췄거나, 이미 새 녹음이 시작됨
+        self._stop.set()
+        if TEST_INPUT:
             log("test input finished")
-            self.recording = False
-            self._stop.set()
             self.status_ch.publish({"type": "recording", "recording": False})
-        elif self.recording:
-            err = (self.ffmpeg.stderr.read() or b"").decode(errors="ignore").strip()
-            self.recording = False
-            self._stop.set()
+        else:
+            err = (ffmpeg.stderr.read() or b"").decode(errors="ignore").strip()
             self.status_ch.publish({"type": "error", "message": f"녹음이 멈췄습니다: {err[:200] or '마이크 권한을 확인하세요'}"})
             self.status_ch.publish({"type": "recording", "recording": False})
 
     def _transcribe_loop(self) -> None:
+        segments, session_dir = self.segments, self.session_dir
         while True:
-            path = self.segments.get()
+            path = segments.get()
             if path is None:
                 break
             try:
@@ -680,7 +695,7 @@ class Summarizer:
             finally:
                 path.unlink(missing_ok=True)
         self._summarize_now(final=True)
-        shutil.rmtree(self.session_dir, ignore_errors=True)
+        shutil.rmtree(session_dir, ignore_errors=True)
 
     def _transcribe_segment(self, path: Path) -> None:
         whisper = _bin("whisper-cli")
@@ -718,11 +733,13 @@ class Summarizer:
 
         녹음 도중 도우미가 죽으면 다시 띄운다 (minute-summary의 규칙: 종료 코드 2는 되풀이해도 소용없는
         문제라 그만두고, 그 밖은 1·2·4·8·15초 뒤 다시 시작. 1분 넘게 잘 돌았으면 횟수를 다시 센다)."""
-        restarts = 0
+        restarts, gen, session_dir = 0, self.session, self.session_dir
         while True:
             proc, began = self.stt, time.time()
             committed, prev = 0, []  # 이번 발화에서 줄로 올린 문장 수, 직전 partial의 문장들
             for raw in proc.stdout:
+                if self.session != gen:
+                    continue  # 이미 새 녹음이 시작됨: 이 도우미의 남은 출력은 새 녹음에 넣지 않는다
                 try:
                     ev = json.loads(raw)
                 except ValueError:
@@ -748,8 +765,12 @@ class Summarizer:
                 elif kind == "error":
                     self.status_ch.publish({"type": "error", "message": f"받아쓰기 오류: {ev.get('message', '')}"})
             code = proc.wait()
+            try:
+                proc.stdin.close()  # 죽은 도우미의 입력 파이프 정리 (남은 버퍼를 쓰다 BrokenPipe 경고가 나지 않게)
+            except (OSError, ValueError):
+                pass
             with self.lock:
-                ended = self._stt_eof or not self.recording
+                ended = self._stt_eof or not self.recording or self.session != gen
             if ended:
                 break
             # 녹음 도중에 멈춤: 아직 줄로 안 올린 말부터 살린다
@@ -771,29 +792,42 @@ class Summarizer:
             if self._stop.wait(delay):
                 break
             with self.lock:
-                if self._stt_eof or not self.recording:
+                if self._stt_eof or not self.recording or self.session != gen:
                     break
-                self.stt = self._spawn_stt()
+                try:
+                    self.stt = self._spawn_stt()
+                except OSError as e:
+                    spawn_error = str(e)
+                else:
+                    continue
+            log(f"apple-stt 다시 띄우기 실패: {spawn_error}")
+            self.status_ch.publish({"type": "error", "message": f"받아쓰기 도우미를 다시 띄우지 못했습니다: {spawn_error[:200]}. 녹음을 멈춥니다"})
+            threading.Thread(target=self.stop, daemon=True).start()
+            break
         self._summarize_now(final=True)
-        shutil.rmtree(self.session_dir, ignore_errors=True)
+        shutil.rmtree(session_dir, ignore_errors=True)
 
     # --- 임시 초안 / 저장 ---
 
     def _write_draft(self) -> None:
-        """녹음 중 내용은 임시 초안에만 둔다 (서버가 죽어도 남도록). 정식 저장은 save()."""
-        try:
-            APP_DIR.mkdir(parents=True, exist_ok=True)
-            with self.lock:
-                data = {"started_at": self.started_at, "lines": self.lines, "summary": self.summary,
-                        "summary_tr": self.summary_tr, "translate": self.config["translate"],
-                        "saved": self.saved, "saved_files": self.saved_files,
-                        "summarized_upto": self.summarized_upto, "digests": self.digests,
-                        "digest_upto": self.digest_upto, "digest_from": self.digest_from}
-            tmp = DRAFT_PATH.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-            tmp.replace(DRAFT_PATH)
-        except OSError as e:
-            log(f"draft 저장 실패: {e}")
+        """녹음 중 내용은 임시 초안에만 둔다 (서버가 죽어도 남도록). 정식 저장은 save().
+        여러 스레드가 부르므로 스냅샷부터 교체까지 한 번에 하나씩 (같은 .tmp를 동시에 쓰거나 옛 스냅샷이 새것을 덮지 않게).
+        JSON은 잠금 안에서 만든다: 밖에서 만들면 번역이 줄에 붙는 순간 'dictionary changed size'로 깨진다."""
+        with self._draft_lock:
+            try:
+                APP_DIR.mkdir(parents=True, exist_ok=True)
+                with self.lock:
+                    text = json.dumps({"started_at": self.started_at, "lines": self.lines, "summary": self.summary,
+                                       "summary_tr": self.summary_tr, "translate": self.config["translate"],
+                                       "saved": self.saved, "saved_files": self.saved_files,
+                                       "summarized_upto": self.summarized_upto, "digests": self.digests,
+                                       "digest_upto": self.digest_upto, "digest_from": self.digest_from},
+                                      ensure_ascii=False)
+                tmp = DRAFT_PATH.with_suffix(".tmp")
+                tmp.write_text(text, encoding="utf-8")
+                tmp.replace(DRAFT_PATH)
+            except OSError as e:
+                log(f"draft 저장 실패: {e}")
 
     def _load_draft(self) -> None:
         """서버를 다시 켜도 직전 회의가 화면에 남도록 임시 초안을 불러온다 (저장 여부까지)."""
@@ -848,7 +882,8 @@ class Summarizer:
     # --- 번역 ---
 
     def _translate_loop(self) -> None:
-        while not self._stop.is_set() or self._tr_pending():
+        gen = self.session
+        while self.session == gen and (not self._stop.is_set() or self._tr_pending()):
             self._tr_wake.wait(2)
             self._tr_wake.clear()
             self._translate_pending()
@@ -899,8 +934,8 @@ class Summarizer:
     # --- 요약 ---
 
     def _summary_loop(self) -> None:
-        last = time.time()
-        while not self._stop.wait(1):
+        last, gen = time.time(), self.session
+        while not self._stop.wait(1) and self.session == gen:
             if time.time() - last >= self.config["interval"]:
                 last = time.time()
                 threading.Thread(target=self._summarize_now, daemon=True).start()
@@ -924,9 +959,10 @@ class Summarizer:
             with self.lock:
                 new = self.lines[self.summarized_upto:]
                 upto = len(self.lines)
-                previous = self.summary
-            if char_count(" ".join(l["text"] for l in new)) < DIGEST_MIN_CHARS:
-                return
+                previous, gen = self.summary, self.session
+            chars = char_count(" ".join(l["text"] for l in new))
+            if chars == 0 or (not final and chars < DIGEST_MIN_CHARS):
+                return  # 도중의 조용한 구간은 다음 번에 합친다. 마지막에는 남은 말을 모두 넣는다
             delta = "\n".join(f"[{l['t']}] {l['text']}" for l in new)
             self.summary_ch.publish({"type": "working", "provider": provider})
             try:
@@ -936,6 +972,8 @@ class Summarizer:
                 self.summary_ch.publish({"type": "error", "message": self.summary_error})
                 return
             with self.lock:
+                if self.session != gen:
+                    return  # 그사이 새 녹음이 시작됨
                 self.summary, self.summarized_upto, self.summary_at, self.summary_error = text, upto, time.time(), ""
                 self.saved = False
             self._write_draft()
@@ -960,9 +998,10 @@ class Summarizer:
                 text = "\n".join(l["text"] for l in self.lines[lo:hi])
                 last = next((d for d in reversed(self.digests) if d.get("bullets")), None)
                 prev = "\n".join(last["bullets"]) if last else ""
-                start = self.digest_from or self.started_at
-            if char_count(text) < DIGEST_MIN_CHARS:
-                return  # 조용했던 구간: 포인터를 그대로 두어 다음 구간에 합친다
+                start, gen = self.digest_from or self.started_at, self.session
+            chars = char_count(text)
+            if chars == 0 or (not final and chars < DIGEST_MIN_CHARS):
+                return  # 조용했던 구간: 포인터를 그대로 두어 다음 구간에 합친다 (마지막에는 남은 말을 모두)
             end = time.time()
             entry = {"id": len(self.digests), "start": start, "end": end, "from": lo, "to": hi}
             try:
@@ -970,6 +1009,8 @@ class Summarizer:
             except Exception as e:
                 entry["failed"] = str(e)[:200]  # 실패도 기록한다: 저장 파일에 그 구간의 받아적기가 남도록
             with self.lock:
+                if self.session != gen:
+                    return  # 그사이 새 녹음이 시작됨
                 entry["id"] = len(self.digests)
                 self.digests.append(entry)
                 self.digest_upto, self.digest_from, self.saved = hi, end, False
