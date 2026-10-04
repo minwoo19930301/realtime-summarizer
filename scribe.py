@@ -485,7 +485,11 @@ class Scribe:
             if n % 33 == 0 and len(history) >= 33:
                 noise = sorted(history)[len(history) // 10]
             level = sum(recent) / len(recent)
-            speaking = level > max(MIN_SPEECH_RMS, noise * NOISE_MULTIPLIER)
+            threshold = max(MIN_SPEECH_RMS, noise * NOISE_MULTIPLIER)
+            speaking = level > threshold
+            if n % 10 == 0:  # 약 0.3초마다 화면에 입력 크기를 알려 "듣고 있는지"를 보이게 한다
+                self.status_ch.publish({"type": "level", "level": round(level), "threshold": round(threshold),
+                                        "speaking": speaking})
             if seg:
                 seg.append(frame)
                 if speaking:
@@ -532,7 +536,11 @@ class Scribe:
         # 직전 문장을 힌트로 주면 잡음 구간에서 그 문장을 변형해 베껴 쓰는 걸 확인해서, 사용자가 넣은 이름·용어만 힌트로 준다.
         if self.config["glossary"].strip():
             cmd += ["--prompt", self.config["glossary"].strip()[:300]]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.status_ch.publish({"type": "stt", "busy": True})
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        finally:
+            self.status_ch.publish({"type": "stt", "busy": False})
         text = " ".join(t.strip() for t in r.stdout.splitlines() if t.strip())
         log(f"stt {path.name}: {text[:80]!r}")
         if not text or text in HALLUCINATIONS or BRACKET_ONLY.match(text):
