@@ -32,6 +32,7 @@ from pathlib import Path
 PORT = int(os.environ.get("SUMMARIZER_PORT", "8792"))
 # 테스트용: 마이크 대신 이 오디오 파일을 실시간 속도로 흘려 넣는다 (스피커로 소리를 내지 않고 전체 경로를 확인)
 TEST_INPUT = os.environ.get("SUMMARIZER_INPUT", "")
+CLAUDE_MODEL = os.environ.get("SUMMARIZER_CLAUDE_MODEL", "")
 HERE = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("SUMMARIZER_DATA_DIR", Path.home() / "Documents" / "meetings"))
 WHISPER_MODEL_DIRS = [Path.home() / ".cache" / "whisper", Path("/opt/homebrew/share/whisper-cpp")]
@@ -211,12 +212,17 @@ def default_provider(providers: list[dict]) -> str:
     return local[0] if local else "off"
 
 
-def _run_cli(cmd: list[str], timeout: int, name: str) -> str:
+def _run_cli(cmd: list[str], timeout: int, name: str, stdin_text: str | None = None,
+             extra_env: dict | None = None) -> str:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_clean_env(), cwd=WORK_DIR,
-                       stdin=subprocess.DEVNULL)
+    io = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env={**_clean_env(), **(extra_env or {})},
+                       cwd=WORK_DIR, **io)
     if r.returncode != 0 or not r.stdout.strip():
-        raise RuntimeError((r.stderr or r.stdout).strip()[-300:] or f"{name} 실패")
+        err = (r.stderr or r.stdout).strip()
+        if name == "claude" and "not logged in" in err.lower():
+            raise RuntimeError("claude 에 로그인되어 있지 않습니다 (터미널에서 claude 로 로그인하세요)")
+        raise RuntimeError(err[-300:] or f"{name} 실패")
     return r.stdout.strip()
 
 
@@ -228,7 +234,16 @@ def complete(provider: str, prompt: str, timeout: int = 180) -> str:
         return _run_cli([_bin("cursor-agent-cli") or _bin("agent"), "-p", prompt, "--output-format", "text", "--trust"],
                         timeout, "cursor")
     if provider == "claude":
-        return _run_cli([_bin("claude"), "-p", prompt, "--output-format", "text"], timeout, "claude")
+        # 받아적은 말은 믿을 수 없는 입력이다: 도구를 모두 끄고(--tools ""), 개인 CLAUDE.md·메모리·MCP를 싣지 않는다.
+        # 프롬프트는 통째로 stdin으로 넣는다 (긴 회의에서 인자 길이 한도를 피한다). 모델은 Claude Code 설정을 따르고
+        # SUMMARIZER_CLAUDE_MODEL(예: haiku)로 바꿀 수 있다.
+        cmd = [_bin("claude"), "-p", "--output-format", "text", "--no-session-persistence", "--strict-mcp-config",
+               "--disable-slash-commands"]
+        if CLAUDE_MODEL:
+            cmd += ["--model", CLAUDE_MODEL]
+        cmd += ["--tools", ""]  # 값을 여러 개 받는 옵션이라 맨 끝에 둔다
+        return _run_cli(cmd, timeout, "claude", stdin_text=prompt,
+                        extra_env={"CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"})
     if provider == "codex":
         with tempfile.NamedTemporaryFile("r", suffix=".txt", delete=False) as out:
             out_path = out.name
