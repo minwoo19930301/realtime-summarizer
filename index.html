@@ -49,6 +49,14 @@
   #summaryTr ul { margin: 0; padding-left: 18px; }
   #summaryTr p { margin: 6px 0; }
   .empty { color: var(--muted); }
+  .settings { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 10px 18px;
+              border-bottom: 1px solid var(--line); background: var(--panel); }
+  .settings[hidden] { display: none; }
+  #settingsSummary { color: var(--muted); font-size: 12px; }
+  .live { color: var(--muted); font-style: italic; padding: 2px 0 2px 64px; min-height: 1.4em; }
+  .line .tr.pending { font-style: italic; opacity: .7; }
+  button:disabled { opacity: .45; cursor: default; }
+  #savedNote { color: var(--muted); font-size: 12px; }
   .mic { display: none; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; margin-left: auto; }
   .mic.on { display: inline-flex; }
   .mic .bar { width: 70px; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; position: relative; }
@@ -70,6 +78,13 @@
 <div id="conn">서버와 연결이 끊겼습니다. 다시 연결하는 중… (서버가 꺼졌다면 다시 실행하세요)</div>
 <header>
   <h1><span class="dot" id="dot"></span> Meeting Scribe</h1>
+  <span id="settingsSummary"></span>
+  <div class="spacer"></div>
+  <button id="settingsBtn" aria-expanded="false" title="설정 펼치기/접기">설정 ▾</button>
+  <button id="save" disabled title="받아적기·번역·요약을 파일로 저장">저장</button>
+  <button id="toggle" class="primary">녹음 시작</button>
+</header>
+<div class="settings" id="settings" hidden>
   <label>마이크 <select id="device"></select></label>
   <label>받아적기 모델 <select id="model"></select></label>
   <label>요약·번역 모델 <select id="provider"></select></label>
@@ -79,10 +94,7 @@
       <option value="30">30초</option><option value="60">1분</option><option value="120">2분</option><option value="300">5분</option>
     </select>
   </label>
-  <div class="spacer"></div>
-  <button id="refresh" title="마이크·모델·프로바이더 다시 찾기">다시 찾기</button>
-  <button id="toggle" class="primary">녹음 시작</button>
-</header>
+</div>
 
 <main>
   <section>
@@ -98,12 +110,7 @@
       <div class="err" id="serr"></div></div>
   </section>
 </main>
-<div class="note">
-  <span id="files"></span>
-  <label style="margin:6px 0">자주 나오는 이름·용어
-    <input type="text" id="glossary" style="width:420px;max-width:100%" placeholder="받아쓰기가 자주 틀리는 이름·용어를 쉼표로 (선택)">
-  </label>
-</div>
+<div class="note"><span id="savedNote"></span></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -127,7 +134,11 @@ function renderControls() {
   fill($("provider"), state.providers, c.provider, state.auto_provider);
   fill($("translate"), state.languages, c.translate);
   $("interval").value = String(c.interval);
-  if (document.activeElement !== $("glossary")) $("glossary").value = c.glossary || "";
+  const pick = (list, id) => (list.find((x) => x.id === id) || {}).name || "";
+  const short = (s) => s.split(" (")[0].split(" · ")[0];
+  $("settingsSummary").textContent = [short(pick(state.models, c.model)), short(pick(state.providers, c.provider)),
+    c.translate !== "off" ? "번역 " + short(pick(state.languages, c.translate)) : "", `요약 ${c.interval >= 60 ? c.interval / 60 + "분" : c.interval + "초"}마다`]
+    .filter(Boolean).join(" · ");
   const rec = state.recording;
   $("toggle").textContent = rec ? "녹음 중지" : "녹음 시작";
   $("toggle").classList.toggle("stop", rec);
@@ -135,13 +146,30 @@ function renderControls() {
   $("mic").classList.toggle("on", rec);
   if (!rec) { $("micbar").style.width = "0"; $("mic").classList.remove("speaking"); }
   for (const id of ["device", "model"]) $(id).disabled = rec;
-  const f = state.files || {};
-  $("files").textContent = f.transcript ? `저장: ${f.transcript}  ·  ${f.summary}` : "";
+  renderSave();
+}
+
+function renderSave() {
+  const hasContent = (state.lines || []).length > 0 || !!state.summary;
+  $("save").disabled = !hasContent || state.saved;
+  $("save").textContent = hasContent && state.saved ? "저장됨" : "저장";
+  const files = Object.values(state.saved_files || {}).join("  ·  ");
+  $("savedNote").textContent = !hasContent ? ""
+    : state.saved ? `저장됨: ${files}`
+    : files ? `저장한 뒤로 내용이 더 생겼습니다. 다시 "저장"을 누르면 같은 파일에 덮어씁니다.`
+    : `아직 파일로 저장하지 않았습니다 (임시 보관 중). 끝나면 "저장"을 누르세요.`;
+}
+
+// 새 줄·번역·요약이 오면 저장 안 된 상태로 표시
+function markDirty() {
+  if (!state) return;
+  state.saved = false;
+  renderSave();
 }
 
 function addLine(l) {
   const box = $("transcript");
-  if (box.querySelector(".empty")) box.innerHTML = "";
+  box.querySelector(".empty")?.remove();
   const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
   const row = document.createElement("div");
   row.className = "line";
@@ -149,8 +177,11 @@ function addLine(l) {
   row.innerHTML = `<span class="t"></span><span><span class="x"></span><span class="tr"></span></span>`;
   row.querySelector(".t").textContent = l.t;
   row.querySelector(".x").textContent = l.text;
-  row.querySelector(".tr").textContent = l.tr || "";
-  box.appendChild(row);
+  const tr = row.querySelector(".tr");
+  if (l.tr) tr.textContent = l.tr;
+  else if (state && state.config.translate !== "off") { tr.textContent = "번역 중…"; tr.classList.add("pending"); }
+  const live = box.querySelector(".live");
+  box.insertBefore(row, live);
   if (stick) box.scrollTop = box.scrollHeight;
   $("tmeta").textContent = `${box.querySelectorAll(".line").length}줄`;
 }
@@ -185,8 +216,9 @@ async function load() {
   state = await (await fetch("/api/state")).json();
   renderControls();
   $("transcript").innerHTML = state.lines.length ? ""
-    : state.recording ? '<div class="empty">듣는 중… 말을 잠깐 멈추면 그 구간을 받아적습니다.</div>'
+    : state.recording ? '<div class="empty">듣는 중…</div>'
     : '<div class="empty">녹음을 시작하면 여기에 실시간으로 받아적습니다.</div>';
+  if (!$("transcript").querySelector(".live")) $("transcript").insertAdjacentHTML("beforeend", '<div class="live"></div>');
   state.lines.forEach(addLine);
   setSummary(state.summary, state.summary_at, state.config.provider);
   $("summaryTr").innerHTML = state.summary_tr ? md(state.summary_tr) : "";
@@ -211,14 +243,25 @@ async function post(path, body) {
 for (const id of ["device", "model", "provider", "interval", "translate"]) {
   $(id).addEventListener("change", () => post("/api/config", { [id]: id === "interval" ? Number($(id).value) : $(id).value }));
 }
-$("glossary").addEventListener("change", () => post("/api/config", { glossary: $("glossary").value.trim() }));
-$("refresh").addEventListener("click", () => post("/api/refresh"));
+function setSettingsOpen(open, refresh) {
+  $("settings").hidden = !open;
+  $("settingsBtn").textContent = open ? "설정 ▴" : "설정 ▾";
+  $("settingsBtn").setAttribute("aria-expanded", String(open));
+  try { localStorage.setItem("scribe-settings-open", open ? "1" : "0"); } catch (e) {}
+  if (open && refresh && state && !state.recording) post("/api/refresh");  // 새로 꽂은 마이크·새로 깐 CLI도 보이게
+}
+$("settingsBtn").addEventListener("click", () => setSettingsOpen($("settings").hidden, true));
+try { setSettingsOpen(localStorage.getItem("scribe-settings-open") === "1", false); } catch (e) { setSettingsOpen(false, false); }
+$("save").addEventListener("click", async () => { await post("/api/save"); });
 $("now").addEventListener("click", () => post("/api/summarize"));
 $("toggle").addEventListener("click", async () => {
+  if (!state) return;
   if (state.recording) return post("/api/stop");
+  const unsaved = ((state.lines || []).length > 0 || state.summary) && !state.saved;
+  if (unsaved && !confirm("저장하지 않은 받아적기가 있습니다. 버리고 새로 녹음할까요?")) return;
   const j = await post("/api/start");
   if (!j || !j.recording) return;  // 시작 실패면 '듣는 중'을 띄우지 않는다
-  $("transcript").innerHTML = '<div class="empty">듣는 중… 말을 잠깐 멈추면 그 구간을 받아적습니다.</div>';
+  $("transcript").innerHTML = '<div class="empty">듣는 중…</div><div class="live"></div>';
   setSummary("", 0); $("summaryTr").innerHTML = ""; $("smeta").textContent = ""; $("tmeta").textContent = ""; $("serr").textContent = "";
 });
 
@@ -236,18 +279,39 @@ function subscribe(path, onEvent) {
 }
 
 subscribe("/events/transcript", (ev) => {
-  if (ev.type === "line") addLine(ev);
+  if (ev.type === "line") { addLine(ev); state?.lines.push(ev); markDirty(); }
+  if (ev.type === "partial") {
+    const box = $("transcript");
+    let live = box.querySelector(".live");
+    if (!live) { live = document.createElement("div"); live.className = "live"; box.appendChild(live); }
+    if (ev.text && box.querySelector(".empty")) box.querySelector(".empty").remove();
+    const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+    live.textContent = ev.text || "";
+    if (stick) box.scrollTop = box.scrollHeight;
+  }
   if (ev.type === "translation") {
     const el = document.querySelector(`.line[data-id="${ev.id}"] .tr`);
-    if (el) el.textContent = ev.text;
+    if (el) { el.textContent = ev.text; el.classList.remove("pending"); }
+    markDirty();
   }
-  if (ev.type === "reset_translations") document.querySelectorAll(".line .tr").forEach((el) => (el.textContent = ""));
-  if (ev.type === "error") $("serr").textContent = ev.message;
+  if (ev.type === "reset_translations") document.querySelectorAll(".line .tr").forEach((el) => {
+    const on = ev.lang && ev.lang !== "off";
+    el.textContent = on ? "번역 중…" : "";
+    el.classList.toggle("pending", on);
+  });
+  if (ev.type === "error") {
+    $("serr").textContent = ev.message;
+    document.querySelectorAll(".line .tr.pending").forEach((el) => { el.textContent = ""; el.classList.remove("pending"); });
+  }
 });
 subscribe("/events/summary", (ev) => {
   if (ev.type === "working") $("smeta").textContent = `요약 중… (${providerName(ev.provider)})`;
-  if (ev.type === "summary") { setSummary(ev.text, ev.at, ev.provider); $("serr").textContent = ""; }
-  if (ev.type === "summary_tr") $("summaryTr").innerHTML = md(ev.text);
+  if (ev.type === "summary") {
+    setSummary(ev.text, ev.at, ev.provider); $("serr").textContent = "";
+    if (state) state.summary = ev.text;
+    markDirty();
+  }
+  if (ev.type === "summary_tr") { $("summaryTr").innerHTML = md(ev.text); markDirty(); }
   if (ev.type === "error") { $("serr").textContent = ev.message; $("smeta").textContent = ""; }
 });
 let sttBusy = false;
@@ -260,6 +324,7 @@ subscribe("/events/status", async (ev) => {
   }
   if (ev.type === "stt") { sttBusy = ev.busy; if (sttBusy) $("micstate").textContent = "받아쓰는 중…"; return; }
   if (ev.type === "error") alert(ev.message);
+  if (ev.type === "notice") { $("tmeta").textContent = ev.message; return; }
   state = await (await fetch("/api/state")).json();
   renderControls();
 });
