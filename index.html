@@ -30,11 +30,11 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
   .dot.on { background: var(--rec); animation: pulse 1.2s infinite; }
   @keyframes pulse { 50% { opacity: .3; } }
-  main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 14px 18px; min-height: 0; }
-  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; padding: 14px 18px; min-height: 0; }
+  @media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
             display: flex; flex-direction: column; min-height: 0; }
-  section > .head { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--line); }
+  section > .head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 11px 14px; border-bottom: 1px solid var(--line); }
   section > .head h2 { font-size: 13px; margin: 0; font-weight: 650; white-space: nowrap; }
   section > .head .meta { color: var(--muted); font-size: 12px; min-width: 0; }
   .body { flex: 1; overflow: auto; padding: 12px 14px; }
