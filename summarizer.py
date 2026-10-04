@@ -390,15 +390,14 @@ def translate_summary(provider: str, lang: str, text: str) -> str:
 # ---------- 이벤트 브로드캐스트 (SSE) ----------
 
 class Channel:
-    def __init__(self) -> None:
+    def __init__(self, name: str) -> None:
+        self.name = name
         self._subs: list[queue.Queue] = []
         self._lock = threading.Lock()
 
-    def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue()
+    def subscribe(self, q: queue.Queue) -> None:
         with self._lock:
             self._subs.append(q)
-        return q
 
     def unsubscribe(self, q: queue.Queue) -> None:
         with self._lock:
@@ -408,7 +407,7 @@ class Channel:
     def publish(self, event: dict) -> None:
         with self._lock:
             for q in self._subs:
-                q.put(event)
+                q.put((self.name, event))
 
 
 # ---------- 녹음 세션 ----------
@@ -430,9 +429,9 @@ def _write_wav(path: Path, pcm: bytes) -> None:
 
 class Summarizer:
     def __init__(self) -> None:
-        self.transcript_ch = Channel()
-        self.summary_ch = Channel()
-        self.status_ch = Channel()
+        self.transcript_ch = Channel("transcript")
+        self.summary_ch = Channel("summary")
+        self.status_ch = Channel("status")
         self.lock = threading.Lock()
         self.devices = list_audio_devices()
         self.models = list_whisper_models()
@@ -996,26 +995,31 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(n) or b"{}") if n else {}
 
-    def _sse(self, channel: Channel) -> None:
+    def _sse(self, channels: list[Channel]) -> None:
+        """채널 셋을 연결 하나로 보낸다. 브라우저는 한 주소에 연결을 6개까지만 열어서,
+        채널마다 연결을 따로 두면 탭 두 개만 열어도 버튼 요청이 막힌다."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        q = channel.subscribe()
+        q: queue.Queue = queue.Queue()
+        for channel in channels:
+            channel.subscribe(q)
         try:
             self.wfile.write(b": ok\n\n")
             self.wfile.flush()
             while True:
                 try:
-                    ev = q.get(timeout=15)
-                    self.wfile.write(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode())
+                    name, ev = q.get(timeout=15)
+                    self.wfile.write(f"data: {json.dumps({'ch': name, **ev}, ensure_ascii=False)}\n\n".encode())
                 except queue.Empty:
                     self.wfile.write(b": ping\n\n")
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
-            channel.unsubscribe(q)
+            for channel in channels:
+                channel.unsubscribe(q)
 
     def do_GET(self) -> None:
         if self.path in ("/", "/index.html"):
@@ -1027,12 +1031,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         elif self.path == "/api/state":
             self._json(SUMMARIZER.state())
-        elif self.path == "/events/transcript":
-            self._sse(SUMMARIZER.transcript_ch)
-        elif self.path == "/events/summary":
-            self._sse(SUMMARIZER.summary_ch)
-        elif self.path == "/events/status":
-            self._sse(SUMMARIZER.status_ch)
+        elif self.path == "/events":
+            self._sse([SUMMARIZER.transcript_ch, SUMMARIZER.summary_ch, SUMMARIZER.status_ch])
         else:
             self._json({"error": "not found"}, 404)
 

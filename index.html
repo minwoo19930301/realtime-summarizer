@@ -318,7 +318,7 @@ $("toggle").addEventListener("click", async () => {
   setSummary("", 0); $("summaryTr").innerHTML = ""; $("digestView").innerHTML = DIGEST_EMPTY; $("smeta").textContent = ""; $("tmeta").textContent = ""; $("serr").textContent = "";
 });
 
-// 서버 이벤트 구독: 끊기면 배너, 다시 붙으면 전체 상태를 새로 불러온다 (재시작한 서버와 화면이 어긋나지 않게)
+// 서버 이벤트 구독 (채널 셋을 연결 하나로): 끊기면 배너, 다시 붙으면 전체 상태를 새로 불러온다 (재시작한 서버와 화면이 어긋나지 않게)
 function subscribe(path, onEvent) {
   const es = new EventSource(path);
   let opened = false;
@@ -331,7 +331,7 @@ function subscribe(path, onEvent) {
   es.onmessage = (e) => onEvent(JSON.parse(e.data));
 }
 
-subscribe("/events/transcript", (ev) => {
+function onTranscript(ev) {
   if (ev.type === "line") { addLine(ev); state?.lines.push(ev); markDirty(); }
   if (ev.type === "partial") {
     const box = $("transcript");
@@ -356,8 +356,8 @@ subscribe("/events/transcript", (ev) => {
     $("serr").textContent = ev.message;
     document.querySelectorAll(".line .tr.pending").forEach((el) => { el.textContent = ""; el.classList.remove("pending"); });
   }
-});
-subscribe("/events/summary", (ev) => {
+}
+function onSummary(ev) {
   if (ev.type === "working") $("smeta").textContent = "요약 중…";
   if (ev.type === "summary") {
     setSummary(ev.text, ev.at); $("serr").textContent = "";
@@ -376,9 +376,9 @@ subscribe("/events/summary", (ev) => {
     $("serr").textContent = ev.message; $("smeta").textContent = "";
     document.querySelectorAll(".dg .tr.pending").forEach((el) => { el.textContent = ""; el.classList.remove("pending"); });
   }
-});
+}
 let sttBusy = false;
-subscribe("/events/status", async (ev) => {
+async function onStatus(ev) {
   if (ev.type === "level") {
     $("micbar").style.width = Math.min(100, Math.round((ev.level / Math.max(1, ev.threshold * 2)) * 100)) + "%";
     $("mic").classList.toggle("speaking", ev.speaking);
@@ -390,7 +390,9 @@ subscribe("/events/status", async (ev) => {
   if (ev.type === "notice") { $("tmeta").textContent = ev.message; return; }
   state = await (await fetch("/api/state")).json();
   renderControls();
-});
+}
+const HANDLERS = { transcript: onTranscript, summary: onSummary, status: onStatus };
+subscribe("/events", (ev) => HANDLERS[ev.ch]?.(ev));
 
 load();
 </script>
