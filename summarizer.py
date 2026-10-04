@@ -332,7 +332,7 @@ DIGEST_PROMPT = """<받아쓰기> 안의 글은 회의에서 방금 한 구간 �
 """
 DIGEST_MIN_CHARS = 15  # 공백을 뺀 글자 수가 이보다 적으면 조용했던 구간으로 보고 다음 구간에 합친다
 DIGEST_MAX_BULLETS = 3
-BULLET_MARK = re.compile(r"^\s*(?:[-•·▪‣●○]|\*(?=\s)|\d+[.)])\s*")
+BULLET_MARK = re.compile(r"^\s*(?:[-•·▪‣●○]\s*|\*\s+|\d{1,2}[.)]\s+)")  # 번호는 두 자리까지 ("2026. 10. 4", "3.5%"는 본문)
 
 
 def char_count(text: str) -> int:

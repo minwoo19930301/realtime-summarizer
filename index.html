@@ -183,7 +183,7 @@ function addLine(l) {
   row.querySelector(".t").textContent = l.t;
   row.querySelector(".x").textContent = l.text;
   const tr = row.querySelector(".tr");
-  if (l.tr) tr.textContent = l.tr;
+  if ("tr" in l) tr.textContent = l.tr;  // 빈 번역("")도 끝난 것: 다시 "번역 중…"으로 두지 않는다
   else if (state && state.config.translate !== "off") { tr.textContent = "번역 중…"; tr.classList.add("pending"); }
   const live = box.querySelector(".live");
   box.insertBefore(row, live);
@@ -226,7 +226,7 @@ function addDigest(d) {
       li.textContent = b;
       const tr = document.createElement("span");
       tr.className = "tr";
-      if (d.tr && d.tr[i]) tr.textContent = d.tr[i];
+      if (d.tr) tr.textContent = d.tr[i] || "";
       else if (state && state.config.translate !== "off") { tr.textContent = "번역 중…"; tr.classList.add("pending"); }
       li.appendChild(tr);
       ul.appendChild(li);
