@@ -44,6 +44,15 @@
   .line .tr:empty { display: none; }
   #summaryTr { border-top: 1px dashed var(--line); margin-top: 14px; padding-top: 12px; }
   #summaryTr:empty { display: none; }
+  .tab { border: 0; background: none; padding: 0; font-size: 13px; font-weight: 650; color: var(--muted); cursor: pointer; }
+  .tab.on { color: var(--ink); }
+  .dg { padding: 4px 0 10px; }
+  .dg + .dg { border-top: 1px solid var(--line); padding-top: 10px; }
+  .dg .when { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .dg ul { margin: 4px 0 0; padding-left: 18px; }
+  .dg .tr { display: block; color: var(--muted); font-size: 13px; }
+  .dg .tr:empty { display: none; }
+  .dg .tr.pending { font-style: italic; opacity: .7; }
   #summaryTr h2 { font-size: 14px; margin: 14px 0 6px; }
   #summaryTr h2:first-child { margin-top: 0; }
   #summaryTr ul { margin: 0; padding-left: 18px; }
@@ -102,10 +111,12 @@
     <div class="body" id="transcript"><div class="empty">녹음을 시작하면 여기에 실시간으로 받아적습니다.</div></div>
   </section>
   <section>
-    <div class="head"><h2>요약</h2><span class="meta" id="smeta"></span>
-      <div class="spacer"></div><button id="now">지금 요약</button></div>
-    <div class="body"><div id="summary"><div class="empty">받아적은 내용이 쌓이면 주기마다 요약을 갱신합니다.</div></div>
-      <div id="summaryTr"></div>
+    <div class="head"><button class="tab on" data-view="full">전체 요약</button><button class="tab" data-view="digest">구간 요약</button>
+      <span class="meta" id="smeta"></span><div class="spacer"></div><button id="now">지금 요약</button></div>
+    <div class="body" id="sbody">
+      <div id="fullView"><div id="summary"><div class="empty">받아적은 내용이 쌓이면 주기마다 요약을 갱신합니다.</div></div>
+        <div id="summaryTr"></div></div>
+      <div id="digestView" hidden></div>
       <div class="err" id="serr"></div></div>
   </section>
 </main>
@@ -144,7 +155,7 @@ function renderControls() {
 }
 
 function renderSave() {
-  const hasContent = (state.lines || []).length > 0 || !!state.summary;
+  const hasContent = (state.lines || []).length > 0 || !!state.summary || (state.digests || []).length > 0;
   $("save").disabled = !hasContent || state.saved;
   $("save").textContent = hasContent && state.saved ? "저장됨" : "저장";
   const files = Object.values(state.saved_files || {}).join("  ·  ");
@@ -196,6 +207,57 @@ function md(text) {
   return html.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
 }
 
+const DIGEST_EMPTY = '<div class="empty">요약 주기마다 그 구간에 나온 말을 1~3줄로 정리합니다.</div>';
+const hm = (ts) => new Date(ts * 1000).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", hour12: false });
+
+function addDigest(d) {
+  const view = $("digestView"), box = $("sbody");
+  view.querySelector(".empty")?.remove();
+  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  const el = document.createElement("div");
+  el.className = "dg";
+  el.dataset.id = d.id;
+  el.innerHTML = '<div class="when"></div>';
+  el.querySelector(".when").textContent = hm(d.start) === hm(d.end) ? hm(d.start) : `${hm(d.start)}–${hm(d.end)}`;
+  if (d.bullets && d.bullets.length) {
+    const ul = document.createElement("ul");
+    d.bullets.forEach((b, i) => {
+      const li = document.createElement("li");
+      li.textContent = b;
+      const tr = document.createElement("span");
+      tr.className = "tr";
+      if (d.tr && d.tr[i]) tr.textContent = d.tr[i];
+      else if (state && state.config.translate !== "off") { tr.textContent = "번역 중…"; tr.classList.add("pending"); }
+      li.appendChild(tr);
+      ul.appendChild(li);
+    });
+    el.appendChild(ul);
+  } else {
+    const p = document.createElement("div");
+    p.className = "err";
+    p.textContent = `요약하지 못했습니다: ${d.failed || ""}`;
+    el.appendChild(p);
+  }
+  view.appendChild(el);
+  if (stick && !view.hidden) box.scrollTop = box.scrollHeight;
+}
+
+function setDigestTr(id, tr) {
+  document.querySelectorAll(`.dg[data-id="${id}"] li .tr`).forEach((el, i) => {
+    el.textContent = tr[i] || "";
+    el.classList.remove("pending");
+  });
+}
+
+function setView(view) {
+  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("on", b.dataset.view === view));
+  $("fullView").hidden = view !== "full";
+  $("digestView").hidden = view !== "digest";
+  try { localStorage.setItem("summarizer-summary-view", view); } catch (e) {}
+}
+document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
+try { setView(localStorage.getItem("summarizer-summary-view") === "digest" ? "digest" : "full"); } catch (e) { setView("full"); }
+
 function setSummary(text, at) {
   $("summary").innerHTML = text ? md(text) : '<div class="empty">받아적은 내용이 쌓이면 주기마다 요약을 갱신합니다.</div>';
   if (at) $("smeta").textContent = `${new Date(at * 1000).toLocaleTimeString("ko-KR")} 갱신`;
@@ -211,6 +273,8 @@ async function load() {
   state.lines.forEach(addLine);
   setSummary(state.summary, state.summary_at);
   $("summaryTr").innerHTML = state.summary_tr ? md(state.summary_tr) : "";
+  $("digestView").innerHTML = DIGEST_EMPTY;
+  (state.digests || []).forEach(addDigest);
   $("serr").textContent = state.summary_error || "";
 }
 
@@ -251,7 +315,7 @@ $("toggle").addEventListener("click", async () => {
   const j = await post("/api/start");
   if (!j || !j.recording) return;  // 시작 실패면 '듣는 중'을 띄우지 않는다
   $("transcript").innerHTML = '<div class="empty">듣는 중…</div><div class="live"></div>';
-  setSummary("", 0); $("summaryTr").innerHTML = ""; $("smeta").textContent = ""; $("tmeta").textContent = ""; $("serr").textContent = "";
+  setSummary("", 0); $("summaryTr").innerHTML = ""; $("digestView").innerHTML = DIGEST_EMPTY; $("smeta").textContent = ""; $("tmeta").textContent = ""; $("serr").textContent = "";
 });
 
 // 서버 이벤트 구독: 끊기면 배너, 다시 붙으면 전체 상태를 새로 불러온다 (재시작한 서버와 화면이 어긋나지 않게)
@@ -283,7 +347,7 @@ subscribe("/events/transcript", (ev) => {
     if (el) { el.textContent = ev.text; el.classList.remove("pending"); }
     markDirty();
   }
-  if (ev.type === "reset_translations") document.querySelectorAll(".line .tr").forEach((el) => {
+  if (ev.type === "reset_translations") document.querySelectorAll(".line .tr, .dg li .tr").forEach((el) => {
     const on = ev.lang && ev.lang !== "off";
     el.textContent = on ? "번역 중…" : "";
     el.classList.toggle("pending", on);
@@ -301,7 +365,17 @@ subscribe("/events/summary", (ev) => {
     markDirty();
   }
   if (ev.type === "summary_tr") { $("summaryTr").innerHTML = md(ev.text); markDirty(); }
-  if (ev.type === "error") { $("serr").textContent = ev.message; $("smeta").textContent = ""; }
+  if (ev.type === "digest") { addDigest(ev); state?.digests.push(ev); markDirty(); }
+  if (ev.type === "digest_tr") {
+    setDigestTr(ev.id, ev.tr);
+    const d = state?.digests.find((x) => x.id === ev.id);
+    if (d) d.tr = ev.tr;
+    markDirty();
+  }
+  if (ev.type === "error") {
+    $("serr").textContent = ev.message; $("smeta").textContent = "";
+    document.querySelectorAll(".dg .tr.pending").forEach((el) => { el.textContent = ""; el.classList.remove("pending"); });
+  }
 });
 let sttBusy = false;
 subscribe("/events/status", async (ev) => {

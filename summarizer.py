@@ -930,8 +930,7 @@ class Summarizer:
                 self.digest_upto, self.digest_from, self.saved = hi, end, False
             self._write_draft()
             self.summary_ch.publish({"type": "digest", **entry})
-            span = f"{time.strftime('%H:%M', time.localtime(start))}–{time.strftime('%H:%M', time.localtime(end))}"
-            log(f"구간 요약 {span}: " + (" / ".join(entry.get("bullets", [])) or f"실패 ({entry.get('failed')})"))
+            log(f"구간 요약 {time.strftime('%H:%M:%S', time.localtime(start))}–{time.strftime('%H:%M:%S', time.localtime(end))}: " + (" / ".join(entry.get("bullets", [])) or f"실패 ({entry.get('failed')})"))
             # 팀즈 등에 올릴 때는 여기서 entry["bullets"]를 보내면 된다.
             lang = self.config["translate"]
             if lang != "off" and entry.get("bullets"):
@@ -961,7 +960,8 @@ def render_digests(digests: list[dict], lines: list[dict], started: float) -> st
     hm = lambda ts: time.strftime("%H:%M", time.localtime(ts))
     out = [f"# {time.strftime('%Y-%m-%d %H:%M', time.localtime(started or time.time()))} 회의 구간 요약", ""]
     for d in digests:
-        out += [f"## {hm(d['start'])}–{hm(d['end'])}", ""]
+        span = hm(d["start"]) if hm(d["start"]) == hm(d["end"]) else f"{hm(d['start'])}–{hm(d['end'])}"
+        out += [f"## {span}", ""]
         if d.get("bullets"):
             tr = d.get("tr") or []
             for i, b in enumerate(d["bullets"]):
