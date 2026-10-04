@@ -2,7 +2,10 @@
 
     python3 scribe.py          # http://localhost:8792
 
-받아적기: ffmpeg(avfoundation)로 10초 단위 녹음 → whisper-cli(whisper.cpp)로 텍스트화.
+받아적기: ffmpeg(avfoundation)로 녹음 → 기본은 macOS 온디바이스 실시간 받아쓰기(bin/apple-stt, 말하는 도중 중간 결과),
+          또는 무음 지점에서 잘라 whisper-cli(whisper.cpp)로 텍스트화.
+저장: 녹음 중에는 임시 초안(~/Library/Application Support/Meeting Scribe/draft.json)에만 두고, 화면의 "저장"을 누르면
+      ~/Documents/meetings 에 받아적기·번역·요약 파일로 남긴다.
 요약: 지금까지의 요약 + 새로 받아적은 부분을 프로바이더에 넘겨 전체 요약을 다시 씀.
 프로바이더는 이 맥에서 쓸 수 있는 것을 자동으로 찾아 기본값으로 두고, 화면에서 바꿀 수 있다.
 외부 의존성 없음(표준 라이브러리만).
@@ -34,7 +37,15 @@ DATA_DIR = Path(os.environ.get("SCRIBE_DATA_DIR", Path.home() / "Documents" / "m
 WHISPER_MODEL_DIRS = [Path.home() / ".cache" / "whisper", Path("/opt/homebrew/share/whisper-cpp")]
 OLLAMA_URL = "http://localhost:11434"
 # 에이전트 CLI들은 실행 폴더를 "신뢰"할지 묻거나 그 폴더를 읽으려 해서, 비어 있는 전용 폴더에서 돌린다.
-WORK_DIR = Path.home() / "Library" / "Application Support" / "Meeting Scribe" / "workdir"
+APP_DIR = Path(os.environ.get("SCRIBE_APP_DIR", Path.home() / "Library" / "Application Support" / "Meeting Scribe"))
+WORK_DIR = APP_DIR / "workdir"
+DRAFT_PATH = APP_DIR / "draft.json"
+APPLE_STT = HERE / "bin" / "apple-stt"
+APPLE_STT_SRC = HERE / "stt" / "apple_stt.swift"
+APPLE_LOCALES = {"ko": "ko-KR", "en": "en-US", "zh": "zh-CN", "ja": "ja-JP"}
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+SENT_END = re.compile(r"(?<=[.?!。？！])\s+")
+
 SAMPLE_RATE = 16000
 FRAME_MS = 30
 # 고정 길이로 자르면 경계에 걸친 문장이 통째로 사라져서, 말이 멈춘 지점(무음)에서 자른다.
@@ -49,6 +60,10 @@ MIN_SPEECH_MS = 1000        # 말소리가 이보다 짧은 덩어리는 버림 
 PREROLL_MS = 1000           # 0.3초 평균으로 판단하는 만큼 시작 감지가 늦어서, 앞쪽을 넉넉히 붙여야 첫 마디가 안 잘림
 HALLUCINATIONS = {"감사합니다.", "시청해주셔서 감사합니다.", "MBC 뉴스 이덕영입니다.", "구독과 좋아요 부탁드립니다."}
 BRACKET_ONLY = re.compile(r"^(\s*[\[\(][^\]\)]*[\]\)]\s*)+$")
+
+
+def split_sentences(text: str) -> list[str]:
+    return [t for t in SENT_END.split((text or "").strip()) if t]
 
 
 def _bin(name: str) -> str | None:
@@ -98,8 +113,27 @@ def default_device(devices: list[dict]) -> str | None:
     return devices[0]["id"] if devices else None
 
 
+def ensure_apple_stt() -> bool:
+    """macOS 온디바이스 실시간 받아쓰기 도우미. 없으면 소스에서 한 번 빌드한다 (Command Line Tools의 swiftc)."""
+    if APPLE_STT.exists() and APPLE_STT.stat().st_mtime >= APPLE_STT_SRC.stat().st_mtime:
+        return True
+    swiftc = _bin("swiftc")
+    if not swiftc or not APPLE_STT_SRC.exists():
+        return APPLE_STT.exists()
+    APPLE_STT.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run([swiftc, "-O", "-swift-version", "5", "-target", "arm64-apple-macos26.0",
+                        str(APPLE_STT_SRC), "-o", str(APPLE_STT)], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if r.returncode != 0:
+        log(f"apple-stt 빌드 실패: {r.stderr.strip()[-300:]}")
+        return False
+    subprocess.run(["codesign", "--force", "--sign", "-", str(APPLE_STT)], capture_output=True, stdin=subprocess.DEVNULL)
+    return True
+
+
 def list_whisper_models() -> list[dict]:
     models = []
+    if ensure_apple_stt():
+        models.append({"id": "apple", "name": "Apple 온디바이스 (실시간)"})
     for d in WHISPER_MODEL_DIRS:
         for p in sorted(glob.glob(str(d / "ggml-*.bin"))):
             name = Path(p).stem.replace("ggml-", "")
@@ -108,6 +142,9 @@ def list_whisper_models() -> list[dict]:
 
 
 def default_whisper_model(models: list[dict]) -> str | None:
+    # 말하는 도중에 글자가 나오는 건 Apple 엔진뿐이라 있으면 기본으로 쓴다
+    if any(m["id"] == "apple" for m in models):
+        return "apple"
     rank = ["large-v3-turbo", "large-v3", "medium", "small", "base", "tiny"]
     for r in rank:
         for m in models:
@@ -144,6 +181,10 @@ def detect_providers() -> list[dict]:
         providers.append({"id": "grok", "name": "Grok Build CLI (사용량 차감)"})
     if _bin("cursor-agent-cli") or _bin("agent"):
         providers.append({"id": "cursor", "name": "Cursor Agent CLI (사용량 차감)"})
+    if _bin("agy"):
+        providers.append({"id": "agy", "name": "Antigravity CLI · agy (사용량 차감)"})
+    if _bin("kiro-cli"):
+        providers.append({"id": "kiro", "name": "Kiro CLI (크레딧 차감)"})
     if _bin("gemini"):
         providers.append({"id": "gemini", "name": "Gemini CLI (사용량 차감)"})
     for pid, (name, key_env, _url, model_env, default_model) in API_PROVIDERS.items():
@@ -163,7 +204,7 @@ def default_provider(providers: list[dict]) -> str:
     ids = [p["id"] for p in providers]
     # 실측해보니 소형 로컬 모델(llama3.2:3b)은 음성인식 오타가 섞인 한국어를 받으면 다른 언어를 섞거나
     # 내용을 지어내서, 품질이 확인된 순서로 고른다. 로컬은 다른 게 없을 때의 대안.
-    for pid in ("claude", "codex", "grok", "cursor", "gemini", "openai", "xai"):
+    for pid in ("claude", "codex", "grok", "cursor", "agy", "kiro", "gemini", "openai", "xai"):
         if pid in ids:
             return pid
     local = [i for i in ids if i.startswith("ollama:") and "r1" not in i] or [i for i in ids if i.startswith("ollama:")]
@@ -202,6 +243,13 @@ def complete(provider: str, prompt: str, timeout: int = 180) -> str:
         if not text:
             raise RuntimeError((r.stderr or r.stdout).strip()[:300] or "codex 실패")
         return text
+    if provider == "agy":
+        return _run_cli([_bin("agy"), "-p", prompt, "--output-format", "text"], timeout, "agy")
+    if provider == "kiro":
+        # 답은 색 코드와 "> " 접두어가 붙어 표준출력으로, 크레딧 표시는 표준에러로 나온다. 도구는 하나도 허용하지 않는다.
+        out = _run_cli([_bin("kiro-cli"), "chat", "--no-interactive", "--trust-tools=", prompt], timeout, "kiro")
+        out = ANSI.sub("", out)
+        return re.sub(r"^\s*>\s?", "", out, count=1).strip()
     if provider == "gemini":
         return _run_cli([_bin("gemini"), "-p", prompt], timeout, "gemini")
     if provider in API_PROVIDERS:
@@ -244,14 +292,8 @@ SUMMARY_PROMPT = """너는 회의록 작성자다. 아래는 지금까지 정리
 """
 
 
-def _glossary_note(glossary: str) -> str:
-    g = glossary.strip()
-    return f"\n참고: 이 회의에 자주 나오는 이름·용어는 다음과 같다. 비슷하게 받아적힌 말은 이 표기로 바로잡아라: {g}\n" if g else ""
-
-
-def summarize(provider: str, previous: str, delta: str, glossary: str = "") -> str:
-    prompt = SUMMARY_PROMPT.format(previous=previous or "(아직 없음)", delta=delta) + _glossary_note(glossary)
-    return complete(provider, prompt)
+def summarize(provider: str, previous: str, delta: str) -> str:
+    return complete(provider, SUMMARY_PROMPT.format(previous=previous or "(아직 없음)", delta=delta))
 
 
 LANGUAGES = {"zh": "중국어 간체(简体中文)", "en": "영어"}
@@ -269,9 +311,9 @@ TRANSLATE_SUMMARY_PROMPT = """아래 회의 요약을 {lang}로 번역해라. �
 """
 
 
-def translate_lines(provider: str, lang: str, texts: list[str], glossary: str = "") -> list[str]:
+def translate_lines(provider: str, lang: str, texts: list[str]) -> list[str]:
     numbered = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(texts))
-    prompt = TRANSLATE_PROMPT.format(lang=LANGUAGES[lang], numbered=numbered) + _glossary_note(glossary)
+    prompt = TRANSLATE_PROMPT.format(lang=LANGUAGES[lang], numbered=numbered)
     out = complete(provider, prompt, timeout=120)
     result = [""] * len(texts)
     for line in out.splitlines():
@@ -342,7 +384,6 @@ class Scribe:
             "interval": 60,
             "language": "ko",
             "translate": "off",
-            "glossary": "",
         }
         self.auto_provider = self.config["provider"]
         self.recording = False
@@ -355,8 +396,11 @@ class Scribe:
         self._tr_wake = threading.Event()
         self._tr_lock = threading.Lock()
         self.session_dir: Path | None = None
-        self.files: dict[str, Path] = {}
+        self.started_at = 0.0
+        self.saved = True            # 저장할 새 내용이 없으면 True
+        self.saved_files: dict[str, str] = {}
         self.ffmpeg: subprocess.Popen | None = None
+        self.stt: subprocess.Popen | None = None  # Apple 실시간 받아쓰기 도우미
         self._stop = threading.Event()
         self._summarizing = threading.Lock()
 
@@ -376,7 +420,9 @@ class Scribe:
             "summary_error": self.summary_error,
             "summary_tr": self.summary_tr,
             "languages": [{"id": "off", "name": "끄기"}] + [{"id": k, "name": v} for k, v in LANGUAGES.items()],
-            "files": {k: str(v) for k, v in self.files.items()},
+            "saved": self.saved,
+            "saved_files": self.saved_files,
+            "data_dir": str(DATA_DIR),
         }
 
     def refresh_sources(self) -> None:
@@ -388,7 +434,7 @@ class Scribe:
 
     def set_config(self, patch: dict) -> None:
         with self.lock:
-            for k in ("device", "model", "provider", "language", "glossary"):
+            for k in ("device", "model", "provider", "language"):
                 if k in patch:
                     self.config[k] = patch[k]
             if "translate" in patch and patch["translate"] != self.config["translate"]:
@@ -397,7 +443,7 @@ class Scribe:
                     line.pop("tr", None)
                 self.summary_tr = ""
                 self._tr_wake.set()
-                self.transcript_ch.publish({"type": "reset_translations"})
+                self.transcript_ch.publish({"type": "reset_translations", "lang": patch["translate"]})
                 threading.Thread(target=self._retranslate, daemon=True).start()
             if "interval" in patch:
                 self.config["interval"] = max(15, int(patch["interval"]))
@@ -411,10 +457,11 @@ class Scribe:
                 return
             if not (self.config["device"] or TEST_INPUT) or not self.config["model"]:
                 raise RuntimeError("마이크 또는 음성인식 모델이 없습니다")
-            stamp = time.strftime("%Y%m%d-%H%M")
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            self.files = {"transcript": DATA_DIR / f"{stamp}-받아적기.txt", "summary": DATA_DIR / f"{stamp}-요약.md",
-                          "translation": DATA_DIR / f"{stamp}-번역.txt"}
+            apple = self.config["model"] == "apple"
+            if apple and not ensure_apple_stt():
+                raise RuntimeError("실시간 받아쓰기 도우미(bin/apple-stt)를 만들 수 없습니다. 받아적기 모델을 whisper로 바꾸세요")
+            self.started_at = time.time()
+            self.saved, self.saved_files = True, {}
             self.session_dir = Path(tempfile.mkdtemp(prefix="scribe-"))
             self.lines, self.summary, self.summary_at, self.summarized_upto, self.summary_error = [], "", 0.0, 0, ""
             self.summary_tr = ""
@@ -428,9 +475,15 @@ class Scribe:
                  "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
+            self.stt = None
+            if apple:
+                locale = APPLE_LOCALES.get(self.config["language"], "ko-KR")
+                self.stt = subprocess.Popen([str(APPLE_STT), "--locale", locale], stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             self.recording = True
+        self._write_draft()
         threading.Thread(target=self._capture_loop, daemon=True).start()
-        threading.Thread(target=self._transcribe_loop, daemon=True).start()
+        threading.Thread(target=self._apple_reader if self.stt else self._transcribe_loop, daemon=True).start()
         threading.Thread(target=self._summary_loop, daemon=True).start()
         threading.Thread(target=self._translate_loop, daemon=True).start()
         self.status_ch.publish({"type": "recording", "recording": True})
@@ -446,6 +499,10 @@ class Scribe:
                     self.ffmpeg.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     self.ffmpeg.kill()
+        # 실시간 도우미는 캡처 루프가 표준입력을 닫으면 스스로 끝난다. 혹시 남으면 10초 뒤 정리.
+        stt = self.stt
+        if stt:
+            threading.Timer(10, lambda: stt.poll() is None and stt.kill()).start()
         self._stop.set()
         self.status_ch.publish({"type": "recording", "recording": False})
 
@@ -490,6 +547,13 @@ class Scribe:
             if n % 10 == 0:  # 약 0.3초마다 화면에 입력 크기를 알려 "듣고 있는지"를 보이게 한다
                 self.status_ch.publish({"type": "level", "level": round(level), "threshold": round(threshold),
                                         "speaking": speaking})
+            if self.stt:  # 실시간 엔진: 무음 분할 없이 소리를 그대로 흘려 넣는다
+                try:
+                    self.stt.stdin.write(frame)
+                    self.stt.stdin.flush()
+                except (BrokenPipeError, ValueError, OSError):
+                    pass
+                continue
             if seg:
                 seg.append(frame)
                 if speaking:
@@ -503,8 +567,14 @@ class Scribe:
                 seg = preroll + [frame]
                 speech_ms, silence_ms = FRAME_MS, 0
             preroll = (preroll + [frame])[-(PREROLL_MS // FRAME_MS):]
-        flush()
-        self.segments.put(None)
+        if self.stt:
+            try:
+                self.stt.stdin.close()  # 입력 끝 → 도우미가 남은 소리를 확정하고 끝낸다
+            except OSError:
+                pass
+        else:
+            flush()
+            self.segments.put(None)
         if self.recording and TEST_INPUT:
             log("test input finished")
             self.recording = False
@@ -532,10 +602,8 @@ class Scribe:
     def _transcribe_segment(self, path: Path) -> None:
         whisper = _bin("whisper-cli")
         lang = self.config["language"] or "auto"
+        # 직전 문장을 힌트(--prompt)로 주면 잡음 구간에서 그 문장을 변형해 베껴 쓰는 걸 확인해서 힌트는 주지 않는다.
         cmd = [whisper, "-m", self.config["model"], "-l", lang, "-f", str(path), "-nt", "-np"]
-        # 직전 문장을 힌트로 주면 잡음 구간에서 그 문장을 변형해 베껴 쓰는 걸 확인해서, 사용자가 넣은 이름·용어만 힌트로 준다.
-        if self.config["glossary"].strip():
-            cmd += ["--prompt", self.config["glossary"].strip()[:300]]
         self.status_ch.publish({"type": "stt", "busy": True})
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
@@ -547,22 +615,90 @@ class Scribe:
             return
         if self.lines and text == self.lines[-1]["text"]:
             return  # 같은 문장이 연달아 나오면 잡음에서 지어낸 것
-        if self._echoes_glossary(text):
-            return  # 소리가 약하면 whisper가 힌트로 준 용어 목록을 그대로 내뱉는다
+        self._add_line(text)
+
+    def _add_line(self, text: str) -> None:
         with self.lock:
             line = {"id": len(self.lines), "t": time.strftime("%H:%M:%S"), "text": text}
             self.lines.append(line)
-            with open(self.files["transcript"], "a", encoding="utf-8") as f:
-                f.write(f"[{line['t']}] {text}\n")
+            self.saved = False
         self.transcript_ch.publish({"type": "line", **line})
         self._tr_wake.set()
+        self._write_draft()
 
-    def _echoes_glossary(self, text: str) -> bool:
-        terms = {t for t in re.split(r"[,\s·/]+", self.config["glossary"]) if t}
-        words = [w for w in re.split(r"[,\s·/.!?]+", text) if w]
-        if not terms or not words:
-            return False
-        return sum(w in terms for w in words) / len(words) >= 0.5
+    def _apple_reader(self) -> None:
+        """실시간 도우미의 JSON 줄: partial은 화면에만, 문장이 굳으면 받아적기 줄로.
+
+        애플 엔진은 말을 멈춰야 final을 준다. 쉬지 않고 이어 말하면 한 줄이 끝없이 길어지므로,
+        partial 안에서 이미 끝난 문장(뒤에 다음 문장이 시작됐고 직전 partial과 글자가 같은 것)은
+        바로 줄로 올린다. final이 오면 아직 안 올린 나머지 문장을 올린다."""
+        proc = self.stt
+        committed, prev = 0, []  # 이번 발화에서 줄로 올린 문장 수, 직전 partial의 문장들
+        for raw in proc.stdout:
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            kind = ev.get("type")
+            if kind == "partial":
+                sents = split_sentences(ev.get("text", ""))
+                while (committed < len(sents) - 1 and committed < len(prev)
+                       and sents[committed] == prev[committed]):
+                    self._add_line(sents[committed])
+                    committed += 1
+                prev = sents
+                self.transcript_ch.publish({"type": "partial", "text": " ".join(sents[committed:])})
+            elif kind == "final":
+                sents = split_sentences(ev.get("text", ""))
+                self.transcript_ch.publish({"type": "partial", "text": ""})
+                log(f"stt final: {' '.join(sents)[:80]!r} (앞 {committed}문장은 이미 올림)")
+                for sent in sents[committed:]:
+                    self._add_line(sent)
+                committed, prev = 0, []
+            elif kind == "status":
+                self.status_ch.publish({"type": "notice", "message": ev.get("message", "")})
+            elif kind == "error":
+                self.status_ch.publish({"type": "error", "message": f"받아쓰기 오류: {ev.get('message', '')}"})
+        proc.wait()
+        self._summarize_now(final=True)
+        shutil.rmtree(self.session_dir, ignore_errors=True)
+
+    # --- 임시 초안 / 저장 ---
+
+    def _write_draft(self) -> None:
+        """녹음 중 내용은 임시 초안에만 둔다 (서버가 죽어도 남도록). 정식 저장은 save()."""
+        try:
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+            with self.lock:
+                data = {"started_at": self.started_at, "lines": self.lines, "summary": self.summary,
+                        "summary_tr": self.summary_tr, "translate": self.config["translate"]}
+            tmp = DRAFT_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(DRAFT_PATH)
+        except OSError as e:
+            log(f"draft 저장 실패: {e}")
+
+    def save(self) -> dict:
+        with self.lock:
+            lines, summary, summary_tr = list(self.lines), self.summary, self.summary_tr
+            started = self.started_at
+        if not lines and not summary:
+            raise RuntimeError("저장할 내용이 없습니다")
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M", time.localtime(started or time.time()))
+        files = {"transcript": DATA_DIR / f"{stamp}-받아적기.txt"}
+        files["transcript"].write_text("".join(f"[{l['t']}] {l['text']}\n" for l in lines), encoding="utf-8")
+        if any(l.get("tr") for l in lines):
+            files["translation"] = DATA_DIR / f"{stamp}-번역.txt"
+            files["translation"].write_text(
+                "".join(f"[{l['t']}] {l['text']}\n          {l.get('tr', '')}\n" for l in lines), encoding="utf-8")
+        if summary:
+            files["summary"] = DATA_DIR / f"{stamp}-요약.md"
+            files["summary"].write_text(summary + (f"\n\n---\n\n{summary_tr}" if summary_tr else "") + "\n", encoding="utf-8")
+        with self.lock:
+            self.saved, self.saved_files = True, {k: str(v) for k, v in files.items()}
+        self.status_ch.publish({"type": "saved"})
+        return self.saved_files
 
     # --- 번역 ---
 
@@ -598,7 +734,7 @@ class Scribe:
                 if not batch:
                     return
                 try:
-                    out = translate_lines(provider, lang, [l["text"] for l in batch], self.config["glossary"])
+                    out = translate_lines(provider, lang, [l["text"] for l in batch])
                 except Exception as e:
                     self.transcript_ch.publish({"type": "error", "message": f"번역 실패: {str(e)[:200]}"})
                     return
@@ -607,11 +743,10 @@ class Scribe:
                 with self.lock:
                     for l, tr in zip(batch, out):
                         l["tr"] = tr
-                    with open(self.files["translation"], "a", encoding="utf-8") as f:
-                        for l in batch:
-                            f.write(f"[{l['t']}] {l['text']}\n          {l['tr']}\n")
+                    self.saved = False
                 for l in batch:
                     self.transcript_ch.publish({"type": "translation", "id": l["id"], "text": l["tr"]})
+                self._write_draft()
 
     # --- 요약 ---
 
@@ -638,20 +773,22 @@ class Scribe:
             delta = "\n".join(f"[{l['t']}] {l['text']}" for l in new)
             self.summary_ch.publish({"type": "working", "provider": provider})
             try:
-                text = summarize(provider, previous, delta, self.config["glossary"])
+                text = summarize(provider, previous, delta)
             except Exception as e:
                 self.summary_error = str(e)
                 self.summary_ch.publish({"type": "error", "message": self.summary_error})
                 return
             with self.lock:
                 self.summary, self.summarized_upto, self.summary_at, self.summary_error = text, upto, time.time(), ""
-                self.files["summary"].write_text(text + "\n", encoding="utf-8")
+                self.saved = False
+            self._write_draft()
             self.summary_ch.publish({"type": "summary", "text": text, "at": self.summary_at, "provider": provider, "final": final})
             lang = self.config["translate"]
             if lang != "off":
                 try:
                     self.summary_tr = translate_summary(provider, lang, text)
                     self.summary_ch.publish({"type": "summary_tr", "text": self.summary_tr, "lang": lang})
+                    self._write_draft()
                 except Exception as e:
                     self.summary_ch.publish({"type": "error", "message": f"요약 번역 실패: {str(e)[:200]}"})
         finally:
@@ -731,6 +868,8 @@ class Handler(BaseHTTPRequestHandler):
                 SCRIBE.refresh_sources()
             elif self.path == "/api/summarize":
                 threading.Thread(target=SCRIBE._summarize_now, daemon=True).start()
+            elif self.path == "/api/save":
+                SCRIBE.save()
             else:
                 return self._json({"error": "not found"}, 404)
             self._json(SCRIBE.state())
@@ -740,12 +879,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     global SCRIBE
-    for tool in ("ffmpeg", "whisper-cli"):
-        if not _bin(tool):
-            raise SystemExit(f"{tool} 가 필요합니다: brew install {'ffmpeg' if tool == 'ffmpeg' else 'whisper-cpp'}")
+    if not _bin("ffmpeg"):
+        raise SystemExit("ffmpeg 가 필요합니다: brew install ffmpeg")
+    # whisper-cli 는 선택 (실시간 Apple 엔진만으로도 동작). 둘 다 없으면 화면에서 시작할 때 알려 준다.
     SCRIBE = Scribe()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"Meeting Scribe: http://localhost:{PORT}  (저장 위치: {DATA_DIR})")
+    print(f"Meeting Scribe: http://localhost:{PORT}  (저장 버튼을 누르면 {DATA_DIR} 에 남깁니다)")
     print(f"요약 프로바이더 자동 선택: {SCRIBE.auto_provider}")
     try:
         server.serve_forever()
