@@ -30,8 +30,17 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
   .dot.on { background: var(--rec); animation: pulse 1.2s infinite; }
   @keyframes pulse { 50% { opacity: .3; } }
-  main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; padding: 14px 18px; min-height: 0; }
-  @media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } }
+  main { flex: 1; display: grid; grid-template-columns: minmax(0, var(--a, 1fr)) 14px minmax(0, var(--b, 1fr));
+         padding: 14px 18px; min-height: 0; }
+  .gutter { cursor: col-resize; display: flex; align-items: center; justify-content: center; touch-action: none; }
+  .gutter::after { content: ""; width: 3px; height: 36px; border-radius: 2px; background: var(--line); }
+  .gutter:hover::after, .gutter.drag::after { background: var(--muted); }
+  body.resizing { user-select: none; cursor: col-resize; }
+  @media (max-width: 860px) {
+    main { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, var(--a, 1fr)) 14px minmax(0, var(--b, 1fr)); }
+    .gutter, body.resizing { cursor: row-resize; }
+    .gutter::after { width: 36px; height: 3px; }
+  }
   section { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
             display: flex; flex-direction: column; min-height: 0; }
   section > .head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 11px 14px; border-bottom: 1px solid var(--line); }
@@ -77,6 +86,17 @@
   #summary h2:first-child { margin-top: 0; }
   #summary ul { margin: 0; padding-left: 18px; }
   #summary p { margin: 6px 0; }
+  #summary .tr { display: block; color: var(--muted); font-size: 13px; font-weight: 400; }
+  #summary h2 .tr { font-size: 12px; }
+  #summary .tr.pending { font-style: italic; opacity: .7; }
+  .modal { position: fixed; inset: 0; z-index: 10; display: flex; align-items: center; justify-content: center;
+           padding: 16px; background: rgba(0, 0, 0, .35); }
+  .modal[hidden] { display: none; }
+  .modal .card { width: 100%; max-width: 380px; background: var(--panel); border: 1px solid var(--line);
+                 border-radius: 12px; padding: 18px; box-shadow: 0 10px 30px rgba(0, 0, 0, .2); }
+  .modal p { margin: 0 0 6px; }
+  .modal .hint { color: var(--muted); font-size: 12px; }
+  .modal .actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 14px; }
   .err { color: var(--rec); font-size: 12px; }
   .note { color: var(--muted); font-size: 12px; padding: 0 18px 12px; }
   details { color: var(--muted); font-size: 12px; }
@@ -110,6 +130,7 @@
       <span class="mic" id="mic"><span class="bar"><i id="micbar"></i></span><span id="micstate">듣는 중</span></span></div>
     <div class="body" id="transcript"><div class="empty">녹음을 시작하면 여기에 실시간으로 받아적습니다.</div></div>
   </section>
+  <div class="gutter" id="gutter" role="separator" title="끌어서 크기 조절, 두 번 누르면 반반"></div>
   <section>
     <div class="head"><button class="tab on" data-view="full">전체 요약</button><button class="tab" data-view="digest">구간 요약</button>
       <span class="meta" id="smeta"></span><div class="spacer"></div><button id="now">지금 요약</button></div>
@@ -121,6 +142,17 @@
   </section>
 </main>
 <div class="note"><span id="savedNote"></span></div>
+<div class="modal" id="startModal" hidden>
+  <div class="card" role="dialog" aria-modal="true" aria-labelledby="startQ">
+    <p id="startQ">이전 받아적기가 있습니다. 이어서 녹음할까요, 새로 녹음할까요?</p>
+    <p class="hint" id="startHint">새로 녹음하면 저장하지 않은 내용은 사라집니다.</p>
+    <div class="actions">
+      <button id="startCancel">취소</button>
+      <button id="startNew">새로 녹음</button>
+      <button id="startResume" class="primary">이어서 녹음</button>
+    </div>
+  </div>
+</div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -172,10 +204,23 @@ function markDirty() {
   renderSave();
 }
 
+// 맨 아래를 보고 있으면 새 줄·번역·중간 자막이 붙을 때마다 맨 아래로 따라간다.
+// 직접 위로 올려 읽는 중에는 멈추고, 다시 맨 아래로 내리면 이어서 따라간다.
+// (전에는 줄이 붙는 순간에만 "맨 아래였나"를 봐서, 번역이 붙어 아래로 밀리면 다음 줄부터 따라가지 않았다)
+function follow(box, active = () => true) {
+  let on = true;
+  box.addEventListener("scroll", () => { on = box.scrollTop + box.clientHeight >= box.scrollHeight - 40; });
+  const stick = () => { if (on && active()) box.scrollTop = box.scrollHeight; };
+  new MutationObserver(stick).observe(box, { childList: true, subtree: true, characterData: true });
+  new ResizeObserver(stick).observe(box);
+  return () => { on = true; stick(); };
+}
+const followTranscript = follow($("transcript"));
+const followDigests = follow($("sbody"), () => !$("digestView").hidden);  // 전체 요약은 통째로 다시 쓰므로 위치를 그대로 둔다
+
 function addLine(l) {
   const box = $("transcript");
   box.querySelector(".empty")?.remove();
-  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
   const row = document.createElement("div");
   row.className = "line";
   row.dataset.id = l.id;
@@ -187,7 +232,6 @@ function addLine(l) {
   else if (state && state.config.translate !== "off") { tr.textContent = "번역 중…"; tr.classList.add("pending"); }
   const live = box.querySelector(".live");
   box.insertBefore(row, live);
-  if (stick) box.scrollTop = box.scrollHeight;
   $("tmeta").textContent = `${box.querySelectorAll(".line").length}줄`;
 }
 
@@ -211,9 +255,8 @@ const DIGEST_EMPTY = '<div class="empty">요약 주기마다 그 구간에 나�
 const hm = (ts) => new Date(ts * 1000).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", hour12: false });
 
 function addDigest(d) {
-  const view = $("digestView"), box = $("sbody");
+  const view = $("digestView");
   view.querySelector(".empty")?.remove();
-  const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
   const el = document.createElement("div");
   el.className = "dg";
   el.dataset.id = d.id;
@@ -239,7 +282,6 @@ function addDigest(d) {
     el.appendChild(p);
   }
   view.appendChild(el);
-  if (stick && !view.hidden) box.scrollTop = box.scrollHeight;
 }
 
 function setDigestTr(id, tr) {
@@ -253,13 +295,45 @@ function setView(view) {
   document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("on", b.dataset.view === view));
   $("fullView").hidden = view !== "full";
   $("digestView").hidden = view !== "digest";
+  if (view === "digest" && typeof followDigests === "function") followDigests();  // 구간 요약은 최신(맨 아래)부터
+  if (view === "full") $("sbody").scrollTop = 0;                                    // 전체 요약은 처음부터 읽는다
   try { localStorage.setItem("summarizer-summary-view", view); } catch (e) {}
 }
 document.querySelectorAll(".tab").forEach((b) => b.addEventListener("click", () => setView(b.dataset.view)));
 try { setView(localStorage.getItem("summarizer-summary-view") === "digest" ? "digest" : "full"); } catch (e) { setView("full"); }
 
+// 요약 한 줄 = 원문 줄, 번역(줄 수가 같은 줄마다 번역)이 있으면 그 줄 바로 밑에. 번역을 켰는데 아직이면 "번역 중…".
+function summaryHtml(text, tr) {
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const lines = text.split("\n");
+  const trl = tr ? tr.split("\n") : null;
+  const aligned = !!trl && trl.length === lines.length;
+  const pending = !tr && !!state && state.config.translate !== "off";  // 번역이 아직 없을 때만
+  let html = "", inList = false;
+  lines.forEach((raw, i) => {
+    const line = raw.trimEnd();
+    const t = aligned ? trl[i].replace(/^\s*(#{1,4}|[-*•])\s+/, "").trim() : "";
+    const sub = t ? `<span class="tr">${esc(t)}</span>` : "";
+    const li = line.match(/^\s*[-*•]\s+(.*)/);
+    if (li) {
+      if (!inList) { html += "<ul>"; inList = true; }
+      html += `<li>${esc(li[1])}${sub || (pending ? '<span class="tr pending">번역 중…</span>' : "")}</li>`;
+      return;
+    }
+    if (inList) { html += "</ul>"; inList = false; }
+    const h = line.match(/^#{1,4}\s+(.*)/);
+    if (h) html += `<h2>${esc(h[1])}${sub}</h2>`;
+    else if (line.trim()) html += `<p>${esc(line)}${sub}</p>`;
+  });
+  if (inList) html += "</ul>";
+  return { html: html.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>"), aligned };
+}
+
 function setSummary(text, at) {
-  $("summary").innerHTML = text ? md(text) : '<div class="empty">받아적은 내용이 쌓이면 주기마다 요약을 갱신합니다.</div>';
+  const tr = state?.summary_tr || "";
+  const { html, aligned } = text ? summaryHtml(text, tr) : { html: "", aligned: false };
+  $("summary").innerHTML = text ? html : '<div class="empty">받아적은 내용이 쌓이면 주기마다 요약을 갱신합니다.</div>';
+  $("summaryTr").innerHTML = text && tr && !aligned ? md(tr) : "";  // 예전 초안의 통번역은 아래에 따로
   if (at) $("smeta").textContent = `${new Date(at * 1000).toLocaleTimeString("ko-KR")} 갱신`;
 }
 
@@ -272,7 +346,6 @@ async function load() {
   if (!$("transcript").querySelector(".live")) $("transcript").insertAdjacentHTML("beforeend", '<div class="live"></div>');
   state.lines.forEach(addLine);
   setSummary(state.summary, state.summary_at);
-  $("summaryTr").innerHTML = state.summary_tr ? md(state.summary_tr) : "";
   $("digestView").innerHTML = DIGEST_EMPTY;
   (state.digests || []).forEach(addDigest);
   $("serr").textContent = state.summary_error || "";
@@ -307,16 +380,70 @@ $("settingsBtn").addEventListener("click", () => setSettingsOpen($("settings").h
 try { setSettingsOpen(localStorage.getItem("summarizer-settings-open") === "1", false); } catch (e) { setSettingsOpen(false, false); }
 $("save").addEventListener("click", async () => { await post("/api/save"); });
 $("now").addEventListener("click", () => post("/api/summarize"));
-$("toggle").addEventListener("click", async () => {
+async function startRecording(resume) {
+  $("startModal").hidden = true;
+  const j = await post("/api/start", { resume });
+  if (!j || !j.recording) return;  // 시작 실패면 '듣는 중'을 띄우지 않는다
+  if (resume) {
+    if (!$("transcript").querySelector(".live")) $("transcript").insertAdjacentHTML("beforeend", '<div class="live"></div>');
+    followTranscript();
+    return;
+  }
+  $("transcript").innerHTML = '<div class="empty">듣는 중…</div><div class="live"></div>';
+  setSummary("", 0); $("digestView").innerHTML = DIGEST_EMPTY; $("smeta").textContent = ""; $("tmeta").textContent = ""; $("serr").textContent = "";
+  followTranscript(); followDigests();
+}
+$("toggle").addEventListener("click", () => {
   if (!state) return;
   if (state.recording) return post("/api/stop");
-  const unsaved = ((state.lines || []).length > 0 || state.summary) && !state.saved;
-  if (unsaved && !confirm("저장하지 않은 받아적기가 있습니다. 버리고 새로 녹음할까요?")) return;
-  const j = await post("/api/start");
-  if (!j || !j.recording) return;  // 시작 실패면 '듣는 중'을 띄우지 않는다
-  $("transcript").innerHTML = '<div class="empty">듣는 중…</div><div class="live"></div>';
-  setSummary("", 0); $("summaryTr").innerHTML = ""; $("digestView").innerHTML = DIGEST_EMPTY; $("smeta").textContent = ""; $("tmeta").textContent = ""; $("serr").textContent = "";
+  const hasContent = (state.lines || []).length > 0 || !!state.summary || (state.digests || []).length > 0;
+  if (!hasContent) return startRecording(false);
+  $("startHint").hidden = !!state.saved;
+  $("startModal").hidden = false;
+  $("startResume").focus();
 });
+$("startResume").addEventListener("click", () => startRecording(true));
+$("startNew").addEventListener("click", () => startRecording(false));
+$("startCancel").addEventListener("click", () => { $("startModal").hidden = true; });
+$("startModal").addEventListener("click", (e) => { if (e.target === $("startModal")) $("startModal").hidden = true; });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("startModal").hidden = true; });
+
+// 받아적기 | 요약 나눔: 가운데 막대를 끌어 비율 조절 (좁은 창에서는 위아래), 두 번 누르면 반반. 비율은 기억한다.
+(function splitter() {
+  const main = document.querySelector("main"), bar = $("gutter");
+  const apply = (r) => {
+    main.style.setProperty("--a", `${r}fr`);
+    main.style.setProperty("--b", `${1 - r}fr`);
+  };
+  let ratio = 0.5;
+  try { ratio = Math.min(0.85, Math.max(0.15, parseFloat(localStorage.getItem("summarizer-split")) || 0.5)); } catch (e) {}
+  apply(ratio);
+  const save = () => { try { localStorage.setItem("summarizer-split", String(ratio)); } catch (e) {} };
+  let dragging = false;
+  const moveTo = (e) => {
+    const box = main.getBoundingClientRect();
+    const stacked = getComputedStyle(main).gridTemplateRows.split(" ").length > 1;
+    const r = stacked ? (e.clientY - box.top) / box.height : (e.clientX - box.left) / box.width;
+    ratio = Math.min(0.85, Math.max(0.15, r));
+    apply(ratio);
+  };
+  bar.addEventListener("pointerdown", (e) => {
+    dragging = true;
+    e.preventDefault();
+    bar.classList.add("drag"); document.body.classList.add("resizing");
+  });
+  window.addEventListener("pointermove", (e) => { if (dragging) moveTo(e); });
+  const end = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    if (e && e.type === "pointerup") moveTo(e);
+    bar.classList.remove("drag"); document.body.classList.remove("resizing");
+    save();
+  };
+  window.addEventListener("pointerup", end);
+  window.addEventListener("pointercancel", end);
+  bar.addEventListener("dblclick", () => { ratio = 0.5; apply(ratio); save(); });
+})();
 
 // 서버 이벤트 구독 (채널 셋을 연결 하나로): 끊기면 배너, 다시 붙으면 전체 상태를 새로 불러온다 (재시작한 서버와 화면이 어긋나지 않게)
 function subscribe(path, onEvent) {
@@ -338,20 +465,21 @@ function onTranscript(ev) {
     let live = box.querySelector(".live");
     if (!live) { live = document.createElement("div"); live.className = "live"; box.appendChild(live); }
     if (ev.text && box.querySelector(".empty")) box.querySelector(".empty").remove();
-    const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
     live.textContent = ev.text || "";
-    if (stick) box.scrollTop = box.scrollHeight;
   }
   if (ev.type === "translation") {
     const el = document.querySelector(`.line[data-id="${ev.id}"] .tr`);
     if (el) { el.textContent = ev.text; el.classList.remove("pending"); }
     markDirty();
   }
-  if (ev.type === "reset_translations") document.querySelectorAll(".line .tr, .dg li .tr").forEach((el) => {
-    const on = ev.lang && ev.lang !== "off";
-    el.textContent = on ? "번역 중…" : "";
-    el.classList.toggle("pending", on);
-  });
+  if (ev.type === "reset_translations") {
+    document.querySelectorAll(".line .tr, .dg li .tr").forEach((el) => {
+      const on = ev.lang && ev.lang !== "off";
+      el.textContent = on ? "번역 중…" : "";
+      el.classList.toggle("pending", on);
+    });
+    if (state) { state.summary_tr = ""; state.config.translate = ev.lang; setSummary(state.summary || "", 0); }
+  }
   if (ev.type === "error") {
     $("serr").textContent = ev.message;
     document.querySelectorAll(".line .tr.pending").forEach((el) => { el.textContent = ""; el.classList.remove("pending"); });
@@ -360,11 +488,15 @@ function onTranscript(ev) {
 function onSummary(ev) {
   if (ev.type === "working") $("smeta").textContent = "요약 중…";
   if (ev.type === "summary") {
+    if (state) { state.summary = ev.text; state.summary_tr = ""; state.summary_at = ev.at; }
     setSummary(ev.text, ev.at); $("serr").textContent = "";
-    if (state) state.summary = ev.text;
     markDirty();
   }
-  if (ev.type === "summary_tr") { $("summaryTr").innerHTML = md(ev.text); markDirty(); }
+  if (ev.type === "summary_tr") {
+    if (state) state.summary_tr = ev.text;
+    setSummary(state?.summary || "", 0);
+    markDirty();
+  }
   if (ev.type === "digest") { addDigest(ev); state?.digests.push(ev); markDirty(); }
   if (ev.type === "digest_tr") {
     setDigestTr(ev.id, ev.tr);
@@ -374,7 +506,7 @@ function onSummary(ev) {
   }
   if (ev.type === "error") {
     $("serr").textContent = ev.message; $("smeta").textContent = "";
-    document.querySelectorAll(".dg .tr.pending").forEach((el) => { el.textContent = ""; el.classList.remove("pending"); });
+    document.querySelectorAll(".dg .tr.pending, #summary .tr.pending").forEach((el) => { el.textContent = ""; el.classList.remove("pending"); });
   }
 }
 let sttBusy = false;
