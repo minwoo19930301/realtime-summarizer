@@ -80,6 +80,31 @@ class Pure(unittest.TestCase):
         self.assertIn("- 10:00:05 첫 안건은 예산", md)  # 공백 정리
 
 
+class SummaryTranslation(unittest.TestCase):
+    SUMMARY = "## 핵심 논의\n- 예산 20% 증액\n\n## 할 일\n- 팀장: 시안 확정"
+
+    def setUp(self):
+        self.orig = S.translate_lines
+        S.translate_lines = lambda provider, lang, texts: [f"EN({t})" for t in texts]
+
+    def tearDown(self):
+        S.translate_lines = self.orig
+
+    def test_translation_keeps_line_structure(self):
+        tr = S.translate_summary("claude", "en", self.SUMMARY)
+        self.assertEqual(tr.splitlines(), ["## EN(핵심 논의)", "- EN(예산 20% 증액)", "", "## EN(할 일)", "- EN(팀장: 시안 확정)"])
+        self.assertIsNotNone(S.aligned_tr(self.SUMMARY, tr))
+
+    def test_saved_summary_puts_translation_under_each_line(self):
+        tr = S.translate_summary("claude", "en", self.SUMMARY)
+        self.assertEqual(S.render_summary(self.SUMMARY, tr),
+                         "## 핵심 논의 / EN(핵심 논의)\n- 예산 20% 증액\n  - EN(예산 20% 증액)\n\n"
+                         "## 할 일 / EN(할 일)\n- 팀장: 시안 확정\n  - EN(팀장: 시안 확정)\n")
+
+    def test_old_whole_translation_goes_below(self):
+        self.assertEqual(S.render_summary("## 가\n- 나", "## A"), "## 가\n- 나\n\n---\n\n## A\n")
+
+
 class Draft(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
