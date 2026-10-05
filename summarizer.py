@@ -33,6 +33,7 @@ PORT = int(os.environ.get("SUMMARIZER_PORT", "8792"))
 # 테스트용: 마이크 대신 이 오디오 파일을 실시간 속도로 흘려 넣는다 (스피커로 소리를 내지 않고 전체 경로를 확인)
 TEST_INPUT = os.environ.get("SUMMARIZER_INPUT", "")
 CLAUDE_MODEL = os.environ.get("SUMMARIZER_CLAUDE_MODEL", "")
+REVEAL_SAVED = os.environ.get("SUMMARIZER_REVEAL", "1") != "0"  # "저장" 뒤 Finder로 저장 위치 열기
 HERE = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("SUMMARIZER_DATA_DIR", Path.home() / "Documents" / "meetings"))
 WHISPER_MODEL_DIRS = [Path.home() / ".cache" / "whisper", Path("/opt/homebrew/share/whisper-cpp")]
@@ -877,6 +878,9 @@ class Summarizer:
             self.saved, self.saved_files = True, {k: str(v) for k, v in files.items()}
         self._write_draft()
         self.status_ch.publish({"type": "saved"})
+        if REVEAL_SAVED and shutil.which("open"):  # 저장한 파일을 Finder에서 골라 둔 채로 연다
+            subprocess.Popen(["open", "-R", str(files.get("summary") or files["transcript"])],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return self.saved_files
 
     # --- 번역 ---
