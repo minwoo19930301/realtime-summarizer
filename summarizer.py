@@ -559,7 +559,8 @@ class Summarizer:
 
     # --- 시작 / 종료 ---
 
-    def start(self) -> None:
+    def start(self, resume: bool = False) -> None:
+        """녹음 시작. resume이면 지금까지의 받아적기·요약·구간 요약에 이어 붙인다 (같은 회의로 저장)."""
         with self.lock:
             if self.recording:
                 return
@@ -569,12 +570,17 @@ class Summarizer:
             if apple and not ensure_apple_stt():
                 raise RuntimeError("실시간 받아쓰기 도우미(bin/apple-stt)를 만들 수 없습니다. 받아적기 모델을 whisper로 바꾸세요")
             self.session += 1
-            self.started_at = time.time()
-            self.saved, self.saved_files = True, {}
+            if resume and (self.lines or self.summary or self.digests):
+                self.summary_error = ""
+                if self.digest_upto >= len(self.lines):
+                    self.digest_from = time.time()  # 쉬는 동안은 구간에 넣지 않는다
+            else:
+                self.started_at = time.time()
+                self.saved, self.saved_files = True, {}
+                self.lines, self.summary, self.summary_at, self.summarized_upto, self.summary_error = [], "", 0.0, 0, ""
+                self.summary_tr = ""
+                self.digests, self.digest_upto, self.digest_from = [], 0, self.started_at
             self.session_dir = Path(tempfile.mkdtemp(prefix="summarizer-"))
-            self.lines, self.summary, self.summary_at, self.summarized_upto, self.summary_error = [], "", 0.0, 0, ""
-            self.summary_tr = ""
-            self.digests, self.digest_upto, self.digest_from = [], 0, self.started_at
             self._stop.clear()
             self.segments: queue.Queue = queue.Queue()
             ffmpeg = _bin("ffmpeg")
@@ -1166,7 +1172,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             if self.path == "/api/start":
-                SUMMARIZER.start()
+                SUMMARIZER.start(resume=bool(self._body().get("resume")))
             elif self.path == "/api/stop":
                 SUMMARIZER.stop()
             elif self.path == "/api/config":
