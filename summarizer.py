@@ -106,7 +106,8 @@ def list_audio_devices() -> list[dict]:
             continue
         m = re.search(r"\[(\d+)\] (.+)$", line)
         if in_audio and m:
-            devices.append({"id": m.group(1), "name": m.group(2).strip()})
+            # 번호가 아니라 이름으로 고른다: 아이폰 마이크가 빠지는 등 장치가 바뀌면 번호가 밀려 엉뚱한(무음) 장치를 잡았다
+            devices.append({"id": m.group(2).strip(), "name": m.group(2).strip()})
     return devices
 
 
@@ -564,6 +565,10 @@ class Summarizer:
         with self.lock:
             if self.recording:
                 return
+            if not TEST_INPUT:  # 녹음할 때마다 장치를 다시 찾고, 고른 장치가 없어졌으면 기본 마이크로
+                self.devices = list_audio_devices()
+                if self.config["device"] not in {d["id"] for d in self.devices}:
+                    self.config["device"] = default_device(self.devices)
             if not (self.config["device"] or TEST_INPUT) or not self.config["model"]:
                 raise RuntimeError("마이크 또는 음성인식 모델이 없습니다")
             apple = self.config["model"] == "apple"
